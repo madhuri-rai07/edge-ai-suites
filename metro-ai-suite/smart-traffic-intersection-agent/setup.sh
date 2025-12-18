@@ -130,108 +130,48 @@ if [ -z "$HOST_IP" ]; then
 fi
 # Function to check if prerequisites are met
 check_and_setup_prerequisites() {
-    local EDGE_AI_SUITES_DIR="edge-ai-suites"
-    local REQUIRED_BRANCH="release-1.2.0"
-    
-    echo -e "${BLUE}==> Checking prerequisites...${NC}"
-    
-    # Check if edge-ai-suites directory exists
-    if [ ! -d "$EDGE_AI_SUITES_DIR" ]; then
-        echo -e "${YELLOW}edge-ai-suites not found. Cloning repository...${NC}"
-        
-        # Clone the repository with the specific branch (shallow clone, only latest layer)
-        git clone --depth 1 --single-branch --branch $REQUIRED_BRANCH https://github.com/open-edge-platform/edge-ai-suites.git
-        
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}Failed to clone edge-ai-suites repository${NC}"
-            return 1
-        fi
-        
-        echo -e "${GREEN}Successfully cloned edge-ai-suites${NC}"
-        
+    echo -e "${BLUE}==> Checking prerequisites (no auto-install) ...${NC}"
+
+    # 1) Docker + Compose availability
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}Docker is not installed or not in PATH${NC}"
+        return 1
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}Docker Compose is not available${NC}"
+        return 1
+    fi
+
+    # 2) External network expected by the Smart Intersection app
+    local SCENESCAPE_NETWORK=${SCENESCAPE_NETWORK:-metro-vision-ai-app-recipe_scenescape}
+    if ! docker network inspect "$SCENESCAPE_NETWORK" >/dev/null 2>&1; then
+        echo -e "${RED}Required external network not found: ${YELLOW}$SCENESCAPE_NETWORK${NC}"
+        echo -e "${YELLOW}Please start the Smart Intersection app independently (recommended)${NC}"
+        echo -e "  e.g., cd metro-ai-suite/metro-vision-ai-app-recipe && docker compose -f compose-scenescape.yml up -d"
+        echo -e "${YELLOW}Or create the network manually for a local demo:${NC}"
+        echo -e "  docker network create $SCENESCAPE_NETWORK"
+        return 1
     else
-        echo -e "${GREEN}edge-ai-suites directory already exists${NC}"
-        
+        echo -e "${GREEN}Found external network: ${YELLOW}$SCENESCAPE_NETWORK${NC}"
     fi
-    
-    # Navigate to the metro-vision-ai-app-recipe directory
-    local METRO_DIR="$EDGE_AI_SUITES_DIR/metro-ai-suite/metro-vision-ai-app-recipe"
-    
-    if [ ! -d "$METRO_DIR" ]; then
-        echo -e "${RED}Directory $METRO_DIR not found${NC}"
-        return 1
-    fi
-    
-    cd "$METRO_DIR"
-    
-    # Check if install.sh exists
-    if [ ! -f "install.sh" ]; then
-        echo -e "${RED}install.sh not found in $METRO_DIR${NC}"
-        cd - > /dev/null
-        return 1
-    fi
-    
-    # Comment out the problematic chown lines in the smart-intersection install.sh
-    echo -e "${BLUE}==> Updating install.sh to comment out chown commands...${NC}"
-    if [ -f "smart-intersection/install.sh" ]; then
-        sed -i 's/^sudo chown -R \$USER:\$USER chart\/files\/secrets$/# &/' smart-intersection/install.sh
-        sed -i 's/^sudo chown -R \$USER:\$USER src\/secrets$/# &/' smart-intersection/install.sh
-        echo -e "${GREEN}Successfully commented out chown commands in smart-intersection/install.sh${NC}"
+
+    # 3) Optional: root CA for MQTT TLS (if the app’s broker/certs are used)
+    # Default relative to this repo: edge-ai-suites path may vary; warn if missing.
+    local DEFAULT_CA_REL="../edge-ai-suites/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/secrets/certs/scenescape-ca.pem"
+    local SCENESCAPE_CA_PATH=${SCENESCAPE_CA_PATH:-$DEFAULT_CA_REL}
+    if [ ! -f "$SCENESCAPE_CA_PATH" ]; then
+        echo -e "${YELLOW}Warning: CA cert not found at ${SCENESCAPE_CA_PATH}${NC}"
+        echo -e "${YELLOW}If your deployment requires MQTT TLS, update 'secrets: root-cert' path in docker/compose.yaml or set SCENESCAPE_CA_PATH.${NC}"
     else
-        echo -e "${YELLOW}Warning: smart-intersection/install.sh not found, skipping sed modifications${NC}"
+        echo -e "${GREEN}CA cert present: ${YELLOW}$SCENESCAPE_CA_PATH${NC}"
     fi
-    
-    # Run the installation script
-    echo -e "${BLUE}==> Running installation script for smart-intersection...${NC}"
-    ./install.sh smart-intersection
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Failed to run install.sh for smart-intersection${NC}"
-        cd - > /dev/null
-        return 1
+
+    # 4) Optional: Planner URL guidance
+    if [ -z "${ROUTE_PLANNER_URL:-}" ]; then
+        echo -e "${YELLOW}Tip: Set ROUTE_PLANNER_URL to the planner endpoint (e.g., http://<planner-host>:7864/plan-route).${NC}"
     fi
-    
-    echo -e "${GREEN}Installation script completed successfully${NC}"
-    
-    # Download container images and run with Docker Compose
-    echo -e "${BLUE}==> Downloading container images and starting services...${NC}"
-    docker compose up -d
-    
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}Failed to start services with docker compose${NC}"
-        cd - > /dev/null
-        return 1
-    fi
-    
-    echo -e "${GREEN}Container images downloaded and services started${NC}"
-    
-    # Verify running status
-    echo -e "${BLUE}==> Verifying running status...${NC}"
-    sleep 5  # Give services a moment to start
-    
-    docker compose ps
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Services are running. Verification completed.${NC}"
-    else
-        echo -e "${YELLOW}Warning: Could not verify service status${NC}"
-    fi
-    
-    # Return to the original directory
-    cd - > /dev/null
-    
-    echo -e "${GREEN}Prerequisites setup completed successfully!${NC}"
-    echo ""
-    
-    # Display edge-ai-suites service URLs
-    echo -e "${BLUE}Edge AI Suites Services:${NC}"
-    echo -e "  • SceneScape Web UI: ${YELLOW}https://${HOST_IP}:443${NC}"
-    echo -e "  • DLStreamer Pipeline Server API: ${YELLOW}http://${HOST_IP}:8080${NC}"
-    echo -e "  • InfluxDB UI: ${YELLOW}http://${HOST_IP}:8086${NC}"
-    echo -e "  • Grafana Dashboard: ${YELLOW}http://${HOST_IP}:3000${NC}"
-    echo -e "  • Node-RED UI: ${YELLOW}http://${HOST_IP}:1880${NC}"
-    echo ""
-    
+
+    echo -e "${GREEN}Prerequisite checks completed.${NC}"
     return 0
 }
 
