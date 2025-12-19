@@ -37,10 +37,10 @@ echo "==> Downloading Smart Intersection: ${SI_RELEASE_TAG}"
 TAG_URL="https://github.com/open-edge-platform/edge-ai-suites/archive/refs/tags/${SI_RELEASE_TAG}.tar.gz"
 BRANCH_URL="https://github.com/open-edge-platform/edge-ai-suites/archive/refs/heads/${SI_RELEASE_TAG}.tar.gz"
 
-HTTP_STATUS=$(curl -s -w "%{http_code}" -o "$TMPDIR/release.tar.gz" "$TAG_URL")
+HTTP_STATUS=$(curl -L -s -w "%{http_code}" -o "$TMPDIR/release.tar.gz" "$TAG_URL")
 if [[ "$HTTP_STATUS" != "200" ]]; then
   echo "Tag not found, attempting branch archive... (${SI_RELEASE_TAG})"
-  HTTP_STATUS=$(curl -s -w "%{http_code}" -o "$TMPDIR/release.tar.gz" "$BRANCH_URL")
+  HTTP_STATUS=$(curl -L -s -w "%{http_code}" -o "$TMPDIR/release.tar.gz" "$BRANCH_URL")
   if [[ "$HTTP_STATUS" != "200" ]]; then
     echo "ERROR: Could not download tag or branch archive for '${SI_RELEASE_TAG}'." >&2
     echo "Tried:" >&2
@@ -84,20 +84,52 @@ echo "==> Running install.sh smart-intersection"
 ./install.sh smart-intersection
 
 if $START_STACK; then
-  case "$SI_STACK" in
-    scenescape)
-      COMPOSE_FILE="compose-scenescape.yml"
-      ;;
-    without-scenescape)
-      COMPOSE_FILE="compose-without-scenescape.yml"
-      ;;
-    *)
-      echo "ERROR: Unknown SI_STACK value: $SI_STACK (expected scenescape|without-scenescape)" >&2
-      exit 1
-      ;;
-  esac
-  echo "==> Starting Smart Intersection stack using $COMPOSE_FILE"
-  docker compose -f "$COMPOSE_FILE" up -d
+  # Prefer docker-compose.yml if install.sh prepared it; otherwise use selected stack file.
+  COMPOSE_TO_USE=""
+  if [[ -f "docker-compose.yml" ]]; then
+    COMPOSE_TO_USE="docker-compose.yml"
+  else
+    case "$SI_STACK" in
+      scenescape)
+        COMPOSE_TO_USE="compose-scenescape.yml"
+        ;;
+      without-scenescape)
+        COMPOSE_TO_USE="compose-without-scenescape.yml"
+        ;;
+      *)
+        echo "ERROR: Unknown SI_STACK value: $SI_STACK (expected scenescape|without-scenescape)" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  # If the chosen compose file is missing, try to fetch from the same tag/branch or fallback to workspace copy.
+  if [[ ! -f "$COMPOSE_TO_USE" ]]; then
+    RAW_BASE="https://raw.githubusercontent.com/open-edge-platform/edge-ai-suites/${SI_RELEASE_TAG}/metro-ai-suite/metro-vision-ai-app-recipe"
+    echo "Compose file '$COMPOSE_TO_USE' not found. Attempting to download from $RAW_BASE ..."
+    if curl -L -sSf -o "$COMPOSE_TO_USE" "${RAW_BASE}/${COMPOSE_TO_USE}" 2>/dev/null; then
+      echo "Downloaded $COMPOSE_TO_USE from ${SI_RELEASE_TAG}."
+    else
+      # Fallback: copy from local workspace if available
+      SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+      WS_RECIPE_DIR="${SCRIPT_DIR}/../../metro-vision-ai-app-recipe"
+      if [[ -f "${WS_RECIPE_DIR}/${COMPOSE_TO_USE}" ]]; then
+        echo "Falling back to workspace compose at ${WS_RECIPE_DIR}/${COMPOSE_TO_USE}"
+        cp "${WS_RECIPE_DIR}/${COMPOSE_TO_USE}" "." || true
+      fi
+    fi
+  fi
+
+  if [[ ! -f "$COMPOSE_TO_USE" ]]; then
+    echo "ERROR: Could not locate a compose file to start the stack." >&2
+    echo "Checked: docker-compose.yml, $COMPOSE_TO_USE" >&2
+    echo "Tried downloading from the '${SI_RELEASE_TAG}' branch/tag and copying from the local workspace." >&2
+    echo "You can still manage the app manually at: $APP_DIR" >&2
+    exit 1
+  fi
+
+  echo "==> Starting Smart Intersection stack using $COMPOSE_TO_USE"
+  docker compose -f "$COMPOSE_TO_USE" up -d
   echo "OK. External network should be present for agent overrides: metro-vision-ai-app-recipe_scenescape"
 fi
 

@@ -5,7 +5,7 @@ name: scene-intelligence
 
 secrets:
   root-cert:
-    file: ../edge-ai-suites/metro-ai-suite/metro-vision-ai-app-recipe/smart-intersection/src/secrets/certs/scenescape-ca.pem
+    file: ../.deps/smart-intersection/main/metro-vision-ai-app-recipe/smart-intersection/src/secrets/certs/scenescape-ca.pem
 
 services:
   # VLM OpenVINO Serving Service
