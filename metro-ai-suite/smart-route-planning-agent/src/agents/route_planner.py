@@ -1,10 +1,14 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import sys
 from typing import List, Optional
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from mcp.client.session import ClientSession
+from mcp.client.stdio import stdio_client, StdioServerParameters
 
 from agents import RoutePlannerState as State
 from agents.planner_state import LiveTrafficState, OptimalRouteState, RouteState
@@ -17,7 +21,6 @@ from config import (
     StaticOptimizerName,
 )
 from controllers import (
-    LiveTrafficController,
     StaticRouteOptimizerFactory,
     ThresholdController,
 )
@@ -46,6 +49,107 @@ class RoutePlanner:
         self.compiled_graph = self._build_graph()
 
         self.live_traffic_status_list: list[LiveTrafficState] = []
+
+        # Initialize MCP client for live traffic data
+        self.mcp_client: Optional[ClientSession] = None
+        self.mcp_transport = None
+        self._mcp_initialized = False
+
+    async def _initialize_mcp_client(self):
+        """Initialize MCP client connection to the MCP server."""
+        if self._mcp_initialized or self.mcp_client:
+            return
+
+        try:
+            logger.info("Initializing MCP client...")
+
+            # Create stdio client transport to communicate with MCP server
+            # stdio_client will spawn: python -m mcp_server
+            server_params = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "mcp_server"]
+            )
+
+            # Create the stdio client context manager
+            # Keep it alive throughout the RoutePlanner lifetime
+            self.mcp_transport = stdio_client(server_params)
+
+            # Enter the context and get the streams
+            read_stream, write_stream = await self.mcp_transport.__aenter__()
+
+            # Create client session with the streams
+            self.mcp_client = ClientSession(read_stream, write_stream)
+
+            # Initialize the client session
+            await self.mcp_client.__aenter__()
+
+            logger.info("MCP client initialized successfully")
+            self._mcp_initialized = True
+
+        except Exception as e:
+            logger.error(f"Failed to initialize MCP client: {e}")
+            self._mcp_initialized = False
+            self.mcp_client = None
+            if self.mcp_transport:
+                try:
+                    await self.mcp_transport.__aexit__(None, None, None)
+                except Exception as cleanup_error:
+                    logger.error(f"Error cleaning up MCP transport: {cleanup_error}")
+            raise
+
+    async def _get_live_traffic_data(self) -> List[LiveTrafficData]:
+        """
+        Fetch live traffic data via MCP tool.
+
+        Falls back to direct LiveTrafficController if MCP is not available.
+
+        Returns:
+            List of LiveTrafficData objects
+        """
+        try:
+            # Try to use MCP client if available
+            if not self._mcp_initialized:
+                await self._initialize_mcp_client()
+
+            if self.mcp_client:
+                logger.info("Fetching live traffic data via MCP tool...")
+
+                # Initialize the client session if not already done
+                try:
+                    await self.mcp_client.initialize()
+                except Exception as e:
+                    logger.debug(f"Client initialization (may already be initialized): {e}")
+
+                # Call the tool
+                result = await self.mcp_client.call_tool("get_live_traffic", {})
+
+                if result and hasattr(result, 'content') and result.content:
+                    # Extract text content from first ContentBlock
+                    first_content = result.content[0]
+                    if hasattr(first_content, 'text'):
+                        response_json = json.loads(first_content.text)
+                        traffic_data_dicts = response_json.get("traffic_data", [])
+
+                        # Convert dicts back to LiveTrafficData objects
+                        all_routes_data = [
+                            LiveTrafficData(**data) for data in traffic_data_dicts
+                        ]
+                        logger.info(
+                            f"Successfully fetched {len(all_routes_data)} traffic records via MCP"
+                        )
+                        return all_routes_data
+
+        except Exception as e:
+            logger.warning(
+                f"MCP tool call failed, falling back to direct controller: {e}"
+            )
+            self._mcp_initialized = False
+
+        # Fallback: use direct controller
+        logger.info("Using direct LiveTrafficController (MCP not available)")
+        from controllers import LiveTrafficController
+        live_traffic_controller = LiveTrafficController()
+        return await live_traffic_controller.fetch_route_status()
 
     async def _find_new_shortest_available_route(
         self, source: str, destination: str, no_fly_list: list[str]
@@ -257,10 +361,9 @@ class RoutePlanner:
         sub_optimal_density: int = 0
 
         # fetch the available live traffic data
-        live_traffic_controller = LiveTrafficController()
         all_routes_data: List[
             LiveTrafficData
-        ] = await live_traffic_controller.fetch_route_status()
+        ] = await self._get_live_traffic_data()
 
         logger.debug(f"Live traffic data received: {all_routes_data}")
 
@@ -312,18 +415,20 @@ class RoutePlanner:
 
                 # Iterate over all routes/intersection found by live traffic controller and proceed with only those which
                 # match the lats and longs of current trackpoint
+                # LiveTrafficController has proximity_factor of 0.0 (exact match)
+                proximity_factor = 0.0
                 for traffic_status in all_routes_data:
                     if (
                         abs(
                             traffic_status.location_coordinates.latitude
                             - trackpoint["lat"]
                         )
-                        <= live_traffic_controller.proximity_factor
+                        <= proximity_factor
                         and abs(
                             traffic_status.location_coordinates.longitude
                             - trackpoint["lon"]
                         )
-                        <= live_traffic_controller.proximity_factor
+                        <= proximity_factor
                     ):
                         route_found_in_live_traffic = True
                         if (

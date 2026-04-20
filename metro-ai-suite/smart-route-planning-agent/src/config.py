@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from enum import Enum
 from pathlib import Path
 
@@ -146,3 +147,9 @@ APP_DETAILS = """# Welcome to Agentic AI Route Planning
 INITIAL_MAP_HTML = (
     "<div class='no-map-style'>Select locations to see the route map</div>"
 )
+
+# MCP Configuration
+# Set to True to use MCP server for live traffic data (default: True for proof-of-concept)
+# Set to False to fall back to direct LiveTrafficController instantiation
+MCP_ENABLED: bool = os.getenv("MCP_ENABLED", "true").lower() in ("true", "1", "yes")
+
