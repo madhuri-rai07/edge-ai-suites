@@ -23,6 +23,7 @@ service:
 
 containerPort: 7860
 containerPortName: agent-uiport
+runtimeClassName: ""
 
 
 # Following values are used to generate config.json in configmap which is mounted into the container.
