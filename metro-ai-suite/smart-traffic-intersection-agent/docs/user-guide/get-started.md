@@ -51,6 +51,82 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/user-apps/tools/usr/lib/
 
 Refer to the [EMT-S documentation](https://github.com/open-edge-platform/edge-microvisor-toolkit-standalone-node) for further details.
 
+## Installing from the OEP App Catalog
+
+The OEP App Catalog lets you discover, inspect, and install this application with a single
+command using the `oep` CLI — no manual cloning or configuration required.
+
+### 1. Install the `oep` CLI
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/intel/edge-ai-suites/main/scripts/oep \
+  -o /usr/local/bin/oep && chmod +x /usr/local/bin/oep
+```
+
+> **Prerequisite:** [`yq`](https://github.com/mikefarah/yq) must be installed
+> (`pip install yq` or `brew install yq`).
+
+### 2. Browse and inspect the app
+
+```bash
+# List all available OEP apps
+oep list
+
+# Search by keyword
+oep search traffic
+
+# View full details: hardware requirements, parameters, install options
+oep info smart-traffic-intersection-agent
+```
+
+### 3. Install via Docker Compose (default)
+
+```bash
+oep install smart-traffic-intersection-agent
+```
+
+This downloads the Compose file and generates a pre-filled `.env` to
+`~/.oep/apps/smart-traffic-intersection-agent/`. Then start the stack:
+
+```bash
+cd ~/.oep/apps/smart-traffic-intersection-agent
+docker compose up -d
+```
+
+### 4. Override configuration parameters
+
+```bash
+# Run inference on GPU instead of CPU
+oep install smart-traffic-intersection-agent --set VLM_TARGET_DEVICE=GPU
+
+# Customise multiple parameters
+oep install smart-traffic-intersection-agent \
+  --set VLM_TARGET_DEVICE=GPU \
+  --set REFRESH_INTERVAL=10 \
+  --set WEATHER_MOCK=true
+```
+
+### 5. Install via Helm (Kubernetes)
+
+```bash
+oep install smart-traffic-intersection-agent --method helm \
+  --set trafficAgent.env.vlmTargetDevice=GPU
+```
+
+### Offline / air-gapped install
+
+```bash
+git clone --filter=blob:none --sparse --branch main \
+  https://github.com/intel/edge-ai-suites.git
+cd edge-ai-suites
+git sparse-checkout set catalog metro-ai-suite/smart-traffic-intersection-agent
+
+export OEP_CATALOG_LOCAL=$(pwd)/catalog
+oep install smart-traffic-intersection-agent
+```
+
+---
+
 ## Quick Start with Setup Script
 
 Intel recommends using the automated setup script that handles environment configuration,

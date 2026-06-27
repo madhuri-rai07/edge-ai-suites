@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# oep-publish — OEP App Catalog publish tool (ODM workflow)
+#
+# Usage:
+#   oep-publish validate <manifest.yaml>
+#   oep-publish register <manifest.yaml>   (adds/updates catalog/index.yaml + app dir)
+#   oep-publish bundle   <manifest.yaml>   (packages Helm chart to OCI registry)
+#
+# Prerequisites: bash, yq, helm (for bundle), cosign (optional, for signing)
+
+set -euo pipefail
+
+CATALOG_ROOT="${OEP_CATALOG_ROOT:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/catalog}"
+
+_red()    { printf "\033[31m%s\033[0m\n" "$*"; }
+_green()  { printf "\033[32m%s\033[0m\n" "$*"; }
+_bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
+_info()   { printf "  \033[36m→\033[0m %s\n" "$*"; }
+_warn()   { printf "  \033[33m⚠\033[0m  %s\n" "$*"; }
+
+_require() {
+    command -v "$1" >/dev/null 2>&1 || { _red "Error: '$1' is required but not found."; exit 1; }
+}
+
+# ── validate ──────────────────────────────────────────────────────────────────
+cmd_validate() {
+    local manifest_file="${1:-}"
+    [[ -z "$manifest_file" || ! -f "$manifest_file" ]] && {
+        _red "Usage: oep-publish validate <manifest.yaml>"; exit 1; }
+    _require yq
+
+    _bold "Validating $manifest_file …"
+    local errors=0
+
+    _check_field() {
+        local field="$1" value
+        value=$(yq "$field" -r "$manifest_file" 2>/dev/null || echo "null")
+        if [[ "$value" == "null" || -z "$value" ]]; then
+            _red "  MISSING required field: $field"
+            (( errors++ )) || true
+        else
+            _info "  $field = $value"
+        fi
+    }
+
+    _check_field '.id'
+    _check_field '.name'
+    _check_field '.version'
+    _check_field '.publisher.name'
+    _check_field '.description'
+    _check_field '.artifacts.compose.localPath'
+    _check_field '.source.repository'
+    _check_field '.source.license'
+
+    local app_id; app_id=$(yq '.id' -r "$manifest_file")
+    local compose_path; compose_path=$(yq '.artifacts.compose.localPath' -r "$manifest_file")
+    local repo_root; repo_root=$(git -C "$(dirname "$manifest_file")" rev-parse --show-toplevel 2>/dev/null || echo "")
+
+    if [[ -n "$repo_root" && ! -f "$repo_root/$compose_path" ]]; then
+        _warn "compose path not found locally: $repo_root/$compose_path"
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        _red "\nValidation FAILED ($errors error(s))"; exit 1
+    fi
+    _green "\n✔ Manifest is valid."
+}
+
+# ── register ──────────────────────────────────────────────────────────────────
+cmd_register() {
+    local manifest_file="${1:-}"
+    [[ -z "$manifest_file" || ! -f "$manifest_file" ]] && {
+        _red "Usage: oep-publish register <manifest.yaml>"; exit 1; }
+
+    cmd_validate "$manifest_file"   # validate first
+
+    _require yq
+
+    local app_id;    app_id=$(yq '.id' -r "$manifest_file")
+    local app_name;  app_name=$(yq '.name' -r "$manifest_file")
+    local version;   version=$(yq '.version' -r "$manifest_file")
+    local suite;     suite=$(yq '.suite' -r "$manifest_file")
+    local publisher; publisher=$(yq '.publisher.name' -r "$manifest_file")
+    local desc;      desc=$(yq '.description' -r "$manifest_file")
+    local tags;      tags=$(yq '.tags | join(", ")' -r "$manifest_file")
+    local today;     today=$(date +%Y-%m-%d)
+
+    # Copy manifest into catalog
+    local dest_dir="$CATALOG_ROOT/apps/$app_id"
+    mkdir -p "$dest_dir"
+    cp "$manifest_file" "$dest_dir/manifest.yaml"
+    _info "Copied manifest → $dest_dir/manifest.yaml"
+
+    # Update catalog/index.yaml
+    local index_file="$CATALOG_ROOT/index.yaml"
+    [[ ! -f "$index_file" ]] && {
+        _red "Catalog index not found: $index_file"; exit 1; }
+
+    # Remove existing entry for this app_id (if any), then append new one
+    yq --arg id "$app_id" 'del(.entries[] | select(.id == $id))' "$index_file" \
+        | yq --arg id "$app_id" \
+             --arg name "$app_name" \
+             --arg ver "$version" \
+             --arg suite "$suite" \
+             --arg pub "$publisher" \
+             --arg desc "$desc" \
+             --arg manifest "apps/$app_id/manifest.yaml" \
+             --arg updated "$today" \
+             '.entries += [{
+                "id":       $id,
+                "name":     $name,
+                "version":  $ver,
+                "suite":    $suite,
+                "publisher":$pub,
+                "description": $desc,
+                "manifest": $manifest,
+                "updated":  $updated
+             }]' \
+        | yq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.generated = $ts' \
+        > "$index_file.tmp" && mv "$index_file.tmp" "$index_file"
+
+    _info "Updated $index_file"
+    _green "\n✔ '$app_id' v$version registered in catalog."
+    echo ""
+    echo "  Next steps:"
+    echo "    1. Review: git diff $CATALOG_ROOT"
+    echo "    2. Commit:  git add catalog/ && git commit -m 'catalog: publish $app_id $version'"
+    echo "    3. Open a PR for review and merge."
+    echo ""
+    echo "  SIs can then install with:"
+    echo "    oep install $app_id"
+}
+
+# ── bundle ────────────────────────────────────────────────────────────────────
+cmd_bundle() {
+    local manifest_file="${1:-}"
+    [[ -z "$manifest_file" || ! -f "$manifest_file" ]] && {
+        _red "Usage: oep-publish bundle <manifest.yaml>"; exit 1; }
+    _require yq
+    _require helm
+
+    local app_id;     app_id=$(yq '.id' -r "$manifest_file")
+    local chart_path; chart_path=$(yq '.artifacts.helm.localPath' -r "$manifest_file")
+    local oci_repo;   oci_repo=$(yq '.artifacts.helm.repository' -r "$manifest_file")
+    local repo_root;  repo_root=$(git -C "$(dirname "$manifest_file")" rev-parse --show-toplevel)
+
+    _bold "Packaging Helm chart for $app_id …"
+    _info "Chart path: $repo_root/$chart_path"
+    _info "OCI target: $oci_repo"
+
+    local pkg_dir; pkg_dir=$(mktemp -d)
+    helm dependency update "$repo_root/$chart_path"
+    helm package "$repo_root/$chart_path" --destination "$pkg_dir"
+
+    local tgz; tgz=$(ls "$pkg_dir"/*.tgz | head -1)
+    _info "Packaged: $tgz"
+
+    if [[ -n "${OEP_OCI_PUSH:-}" ]]; then
+        helm push "$tgz" "$oci_repo"
+        _green "✔ Pushed to $oci_repo"
+
+        if command -v cosign >/dev/null 2>&1; then
+            _info "Signing with cosign …"
+            cosign sign "$oci_repo/$(basename "$tgz" .tgz)"
+            _green "✔ Signed."
+        else
+            _warn "cosign not found — skipping signature (set up cosign for supply-chain security)"
+        fi
+    else
+        _warn "OEP_OCI_PUSH not set — dry run only. Set OEP_OCI_PUSH=1 to actually push."
+        _info "Package ready at: $tgz"
+    fi
+
+    rm -rf "$pkg_dir"
+}
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+    validate) cmd_validate "$@" ;;
+    register) cmd_register "$@" ;;
+    bundle)   cmd_bundle   "$@" ;;
+    help|--help|-h)
+        _bold "oep-publish — OEP Catalog publish tool (ODM)"
+        echo ""
+        echo "  oep-publish validate <manifest.yaml>   Validate manifest schema"
+        echo "  oep-publish register <manifest.yaml>   Add/update app in catalog/index.yaml"
+        echo "  oep-publish bundle   <manifest.yaml>   Package & push Helm chart to OCI"
+        echo ""
+        echo "  Environment variables:"
+        echo "    OEP_CATALOG_ROOT   Local path to catalog/ directory (default: repo root)"
+        echo "    OEP_OCI_PUSH=1     Actually push to OCI registry (default: dry run)"
+        ;;
+    *)
+        _red "Unknown command: $cmd"; echo "Run 'oep-publish help' for usage."; exit 1 ;;
+esac

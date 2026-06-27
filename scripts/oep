@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# oep — OEP App Catalog CLI (SI installer)
+#
+# Usage:
+#   oep search [<keyword>]
+#   oep info   <app-id>
+#   oep install <app-id> [--method compose|helm] [--set KEY=VALUE ...]
+#   oep list
+#
+# Requirements: bash, curl (or local clone), yq, helm (for helm installs)
+
+set -euo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+CATALOG_BASE="${OEP_CATALOG_BASE:-https://raw.githubusercontent.com/intel/edge-ai-suites/main/catalog}"
+INSTALL_DIR="${OEP_INSTALL_DIR:-$HOME/.oep/apps}"
+
+# Auto-detect local catalog: check next to this script, then walk up to repo root
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_auto_local=""
+if [[ -f "$_script_dir/../catalog/index.yaml" ]]; then
+    _auto_local="$(cd "$_script_dir/../catalog" && pwd)"
+elif command -v git >/dev/null 2>&1; then
+    _repo_root="$(git -C "$_script_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$_repo_root" && -f "$_repo_root/catalog/index.yaml" ]] && \
+        _auto_local="$_repo_root/catalog"
+fi
+CATALOG_LOCAL="${OEP_CATALOG_LOCAL:-${_auto_local}}"
+# Repo root = parent of catalog dir (used to resolve artifact localPaths)
+REPO_ROOT="${OEP_REPO_ROOT:-${CATALOG_LOCAL:+$(dirname "$CATALOG_LOCAL")}}"
+REPO_BASE="${OEP_REPO_BASE:-https://raw.githubusercontent.com/intel/edge-ai-suites/main}"
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+_red()   { printf "\033[31m%s\033[0m\n" "$*"; }
+_green() { printf "\033[32m%s\033[0m\n" "$*"; }
+_bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
+_info()  { printf "  \033[36m→\033[0m %s\n" "$*"; }
+
+_require() {
+    command -v "$1" >/dev/null 2>&1 || { _red "Error: '$1' is required but not found."; exit 1; }
+}
+
+_fetch() {
+    local path="$1"
+    if [[ -n "$CATALOG_LOCAL" ]]; then
+        cat "$CATALOG_LOCAL/$path"
+    else
+        curl -fsSL "$CATALOG_BASE/$path"
+    fi
+}
+
+_fetch_index() { _fetch "index.yaml"; }
+_fetch_manifest() { _fetch "apps/$1/manifest.yaml"; }
+
+# Fetch an artifact whose path is relative to the repo root (not the catalog dir)
+_fetch_artifact() {
+    local path="$1"
+    if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/$path" ]]; then
+        cat "$REPO_ROOT/$path"
+    elif [[ -n "$REPO_ROOT" ]]; then
+        _red "Artifact not found locally: $REPO_ROOT/$path"; return 1
+    else
+        curl -fsSL "$REPO_BASE/$path"
+    fi
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    _bold "OEP App Catalog"
+    echo ""
+    _require yq
+    local index; index=$(_fetch_index)
+    echo "$index" | yq '.entries[] | "  " + .id + "  (" + .version + ")  — " + .description' -r
+}
+
+cmd_search() {
+    local keyword="${1:-}"
+    _require yq
+    local index; index=$(_fetch_index)
+    if [[ -z "$keyword" ]]; then
+        cmd_list; return
+    fi
+    echo "$index" | yq --arg kw "$keyword" \
+        '.entries[] | select((.id | test($kw;"i")) or (.description | test($kw;"i")) or (.tags[]? | test($kw;"i"))) |
+        "  \(.id)  (\(.version))  — \(.description)"' -r
+}
+
+cmd_info() {
+    local app_id="${1:-}"
+    [[ -z "$app_id" ]] && { _red "Usage: oep info <app-id>"; exit 1; }
+    _require yq
+    local manifest; manifest=$(_fetch_manifest "$app_id")
+
+    _bold "$(echo "$manifest" | yq '.name' -r)  v$(echo "$manifest" | yq '.version' -r)"
+    echo ""
+    echo "$manifest" | yq '.longDescription' -r
+    echo ""
+    _bold "Tags:"       ; echo "$manifest" | yq '.tags | join(", ")' -r
+    _bold "Hardware:"   ; echo "$manifest" | yq '.requirements.hardware[].label' -r | tr '\n' ' '; echo
+    _bold "Publisher:"  ; echo "$manifest" | yq '.publisher.name' -r
+    _bold "Source:"     ; echo "$manifest" | yq '.source.repository' -r
+    echo ""
+    _bold "Quick install:"
+    echo "  oep install $app_id"
+}
+
+cmd_install() {
+    local app_id="${1:-}"
+    [[ -z "$app_id" ]] && { _red "Usage: oep install <app-id> [--method compose|helm|setup_sh|makefile] [--set KEY=VALUE]"; exit 1; }
+    shift
+
+    local method=""   # empty = auto-detect from manifest installHandler
+    local -a overrides=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --method) method="$2"; shift 2 ;;
+            --set)    overrides+=("$2"); shift 2 ;;
+            *)        _red "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    _require yq
+    local manifest; manifest=$(_fetch_manifest "$app_id")
+    local version;  version=$(echo "$manifest" | yq '.version' -r)
+
+    # Resolve handler: CLI flag > manifest installHandler > fallback to compose
+    local handler; handler=$(echo "$manifest" | yq '.installHandler // "compose"' -r)
+    [[ -n "$method" ]] && handler="$method"
+
+    _bold "Installing $app_id v$version  [handler: $handler]"
+    echo ""
+
+    local app_dir="$INSTALL_DIR/$app_id"
+    mkdir -p "$app_dir"
+
+    case "$handler" in
+        compose)   _install_compose  "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
+        helm)      _install_helm     "$app_id" "$manifest"            "${overrides[@]+"${overrides[@]}"}" ;;
+        setup_sh)  _install_setup_sh "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
+        makefile)  _install_makefile "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
+        *)         _red "Unknown handler: $handler (compose | helm | setup_sh | makefile)"; exit 1 ;;
+    esac
+}
+
+# ── Handler: setup_sh ─────────────────────────────────────────────────────────
+# For apps with complex prerequisites (RI clone, cert generation, model download).
+# Clones the app source via sparse-checkout then delegates to setup.sh --setup.
+_install_setup_sh() {
+    local app_id="$1" manifest="$2" app_dir="$3"
+    shift 3
+    local overrides=("$@")
+
+    local repo;    repo=$(echo "$manifest" | yq '.source.repository' -r)
+    local src_dir; src_dir=$(echo "$manifest" | yq '.source.directory' -r)
+    local branch;  branch=$(echo "$manifest" | yq '.source.branch // "main"' -r)
+    local install_cmd; install_cmd=$(echo "$manifest" | yq '.lifecycle.install // "bash setup.sh --setup"' -r)
+
+    # Resolve required env vars from manifest and check/warn
+    local req_vars; req_vars=$(echo "$manifest" | yq '.lifecycle.env_vars.required[]?.name' -r 2>/dev/null || true)
+    local missing=0
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ -z "${!var:-}" ]]; then
+            local desc; desc=$(echo "$manifest" | \
+                yq --arg v "$var" '.lifecycle.env_vars.required[] | select(.name==$v) | .description' -r)
+            _red "  Required variable not set: $var"
+            _info "$desc"
+            (( missing++ )) || true
+        fi
+    done <<< "$req_vars"
+    [[ $missing -gt 0 ]] && { echo ""; _red "Set the above variable(s) and re-run."; exit 1; }
+
+    # Apply --set overrides as exports (written to a temp env file sourced before setup.sh)
+    local env_override_file; env_override_file=$(mktemp)
+    for kv in "${overrides[@]+"${overrides[@]}"}"; do
+        echo "export $kv" >> "$env_override_file"
+    done
+    # Also apply optional defaults not already in environment
+    while IFS= read -r line; do
+        local key="${line%%=*}" val="${line#*=}"
+        [[ -z "${!key:-}" ]] && echo "export ${key}=${val}" >> "$env_override_file"
+    done < <(echo "$manifest" | yq '.lifecycle.env_vars.optional[]? | .name + "=" + (.default // "")' -r 2>/dev/null || true)
+
+    # If running from within the repo, use the existing source directory directly
+    local work_dir
+    if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/$src_dir" ]]; then
+        work_dir="$REPO_ROOT/$src_dir"
+        _info "Using local source: $work_dir"
+    else
+        # Sparse-clone just the app directory
+        _info "Cloning $repo (sparse: $src_dir) …"
+        _require git
+        git clone --filter=blob:none --sparse --branch "$branch" "$repo" "$app_dir/src" 2>&1 | \
+            sed 's/^/    /'
+        git -C "$app_dir/src" sparse-checkout set "$src_dir"
+        work_dir="$app_dir/src/$src_dir"
+    fi
+
+    _info "Running: $install_cmd"
+    echo ""
+    # Source the env overrides, then run the install command in the app directory
+    (
+        # shellcheck disable=SC1090
+        [[ -s "$env_override_file" ]] && source "$env_override_file"
+        cd "$work_dir"
+        eval "$install_cmd"
+    )
+    local exit_code=$?
+    rm -f "$env_override_file"
+
+    if [[ $exit_code -eq 0 ]]; then
+        echo ""
+        _green "✔ $app_id installed successfully."
+        echo ""
+        echo "  Useful commands (run from $work_dir):"
+        local stop_cmd;  stop_cmd=$(echo  "$manifest" | yq '.lifecycle.stop  // "bash setup.sh --stop"'  -r)
+        local clean_cmd; clean_cmd=$(echo "$manifest" | yq '.lifecycle.clean // "bash setup.sh --clean"' -r)
+        echo "    Stop:  $stop_cmd"
+        echo "    Clean: $clean_cmd"
+    else
+        _red "Install failed (exit $exit_code). Check the output above."; exit "$exit_code"
+    fi
+}
+
+# ── Handler: makefile ─────────────────────────────────────────────────────────
+_install_makefile() {
+    local app_id="$1" manifest="$2" app_dir="$3"
+    shift 3
+    local overrides=("$@")
+    _require make
+
+    local repo;    repo=$(echo "$manifest" | yq '.source.repository' -r)
+    local src_dir; src_dir=$(echo "$manifest" | yq '.source.directory' -r)
+    local branch;  branch=$(echo "$manifest" | yq '.source.branch // "main"' -r)
+
+    local work_dir
+    if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/$src_dir" ]]; then
+        work_dir="$REPO_ROOT/$src_dir"
+    else
+        _require git
+        _info "Cloning $repo …"
+        git clone --filter=blob:none --sparse --branch "$branch" "$repo" "$app_dir/src" 2>&1 | sed 's/^/    /'
+        git -C "$app_dir/src" sparse-checkout set "$src_dir"
+        work_dir="$app_dir/src/$src_dir"
+    fi
+
+    # Build make args from --set overrides (KEY=VALUE passed directly to make)
+    local make_args=("deploy")
+    for kv in "${overrides[@]+"${overrides[@]}"}"; do make_args+=("$kv"); done
+
+    _info "Running: make ${make_args[*]}"
+    (cd "$work_dir" && make "${make_args[@]}")
+    _green "✔ $app_id deployed via make."
+}
+
+_install_compose() {
+    local app_id="$1" manifest="$2" app_dir="$3"
+    shift 3
+    local overrides=("$@")
+
+    local compose_path; compose_path=$(echo "$manifest" | yq '.artifacts.compose.localPath' -r)
+    local env_template; env_template=$(echo "$manifest" | yq '.artifacts.compose.envTemplate // ""' -r)
+
+    _info "Fetching compose file …"
+    if ! _fetch_artifact "$compose_path" > "$app_dir/docker-compose.yaml"; then
+        _red "Could not fetch compose file: $compose_path"; exit 1
+    fi
+
+    # Write .env from overrides
+    local env_file="$app_dir/.env"
+    : > "$env_file"
+    for kv in "${overrides[@]+"${overrides[@]}"}"; do
+        echo "$kv" >> "$env_file"
+    done
+
+    # Apply any default params not already overridden
+    local params; params=$(echo "$manifest" | yq '.parameters[] | .name + "=" + .default' -r)
+    while IFS= read -r line; do
+        local key="${line%%=*}"
+        grep -q "^${key}=" "$env_file" 2>/dev/null || echo "$line" >> "$env_file"
+    done <<< "$params"
+
+    _info "Wrote .env to $env_file"
+    _info "Compose file at $app_dir/docker-compose.yaml"
+    echo ""
+    _green "✔ Ready. To start:"
+    echo "    cd $app_dir && docker compose up -d"
+}
+
+_install_helm() {
+    local app_id="$1" manifest="$2"
+    shift 2
+    local overrides=("$@")
+    _require helm
+
+    local chart_repo; chart_repo=$(echo "$manifest" | yq '.artifacts.helm.repository' -r)
+    local chart_name; chart_name=$(echo "$manifest" | yq '.artifacts.helm.chart' -r)
+    local chart_ver;  chart_ver=$(echo "$manifest" | yq '.artifacts.helm.version' -r)
+
+    local helm_args=("install" "$app_id" "$chart_repo/$chart_name" "--version" "$chart_ver")
+    for kv in "${overrides[@]+"${overrides[@]}"}"; do
+        helm_args+=("--set" "$kv")
+    done
+
+    _info "Running: helm ${helm_args[*]}"
+    helm "${helm_args[@]}"
+    _green "✔ Helm release '$app_id' installed."
+}
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+    list)    cmd_list ;;
+    search)  cmd_search "$@" ;;
+    info)    cmd_info "$@" ;;
+    install) cmd_install "$@" ;;
+    help|--help|-h)
+        _bold "oep — OEP App Catalog CLI"
+        echo ""
+        echo "  oep list                          List all apps in the catalog"
+        echo "  oep search <keyword>              Search apps by keyword"
+        echo "  oep info   <app-id>               Show full app details"
+        echo "  oep install <app-id>              Install using handler declared in manifest"
+        echo ""
+        echo "  Install handlers (auto-selected from manifest, or override with --method):"
+        echo "    setup_sh   Complex apps with prerequisites (runs setup.sh --setup)"
+        echo "    makefile   Apps with a Makefile deploy target (runs make deploy)"
+        echo "    compose    Simple apps (docker compose up -d)"
+        echo "    helm       Kubernetes (helm install)"
+        echo ""
+        echo "  Options:"
+        echo "    --method <handler>          Override the manifest installHandler"
+        echo "    --set KEY=VALUE             Set/override a config parameter (repeatable)"
+        echo ""
+        echo "  Examples:"
+        echo "    oep install smart-traffic-intersection-agent"
+        echo "    oep install smart-traffic-intersection-agent --set VLM_TARGET_DEVICE=GPU"
+        echo "    oep install my-app --method helm --set image.tag=2026.1.0"
+        echo ""
+        echo "  Environment variables:"
+        echo "    OEP_CATALOG_BASE   Remote catalog URL (default: GitHub main branch)"
+        echo "    OEP_CATALOG_LOCAL  Local catalog path (auto-detected when inside repo)"
+        echo "    OEP_INSTALL_DIR    Where app files are placed (default: ~/.oep/apps)"
+        ;;
+    *)
+        _red "Unknown command: $cmd"; echo "Run 'oep help' for usage."; exit 1 ;;
+esac

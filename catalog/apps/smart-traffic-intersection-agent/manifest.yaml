@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# App Manifest: Smart Traffic Intersection Agent
+# -----------------------------------------------
+# Full metadata for this app. Referenced by catalog/index.yaml.
+# ODMs fill in this file when publishing; SIs read it via `oep info`.
+
+apiVersion: catalog.oep.intel.com/v1
+kind: AppManifest
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+id: smart-traffic-intersection-agent
+name: Smart Traffic Intersection Agent
+version: 2026.1.0
+appVersion: "1.0.0"
+suite: metro-ai-suite
+publisher:
+  name: Intel Corporation
+  contact: oep-catalog@intel.com
+
+# ── Description ───────────────────────────────────────────────────────────────
+description: >
+  Real-time traffic intersection analytics powered by Vision Language Model
+  (VLM) inference on Intel hardware. Detects vehicle density, incidents, and
+  pedestrian activity. Exposes a FastAPI backend and Gradio UI dashboard.
+
+longDescription: |
+  The Smart Traffic Intersection Agent connects to a live video feed (via
+  SceneScape / MQTT) and uses an OpenVINO-accelerated VLM to analyse frames
+  at a configurable interval. Results are published over MQTT and displayed
+  in a live Gradio dashboard.
+
+  Key capabilities:
+    - Vehicle density classification (low / moderate / high)
+    - Incident and anomaly detection
+    - Weather-aware analysis (real API or mock mode)
+    - Live system-metrics panel (CPU, GPU, memory)
+    - Helm chart and Docker Compose deployment options
+
+tags: [traffic, vlm, openvino, ovms, gradio, fastapi, mqtt, scenescape]
+category: Video Analytics
+
+# ── Hardware & OS Requirements ────────────────────────────────────────────────
+requirements:
+  hardware:
+    - label: CPU
+      min_cores: 4
+      note: Required; inference runs on CPU by default
+    - label: GPU
+      optional: true
+      note: Intel Arc / Iris Xe; set VLM_TARGET_DEVICE=GPU
+    - label: NPU
+      optional: true
+      note: Intel NPU on supported platforms
+  os:
+    - ubuntu-22.04
+    - ubuntu-24.04
+  software:
+    - docker >= 24.0
+    - docker-compose-plugin >= 2.20
+    - helm >= 3.12          # only for Kubernetes deployment
+
+# ── Artifacts ─────────────────────────────────────────────────────────────────
+artifacts:
+  # Helm chart (Kubernetes)
+  helm:
+    repository: oci://ghcr.io/intel/oep-charts
+    chart: smart-traffic-intersection-agent
+    version: 2026.1.0-helm
+    localPath: metro-ai-suite/smart-traffic-intersection-agent/chart
+
+  # Docker Compose (single-node / dev)
+  compose:
+    localPath: metro-ai-suite/smart-traffic-intersection-agent/docker/agent-compose.yaml
+    envTemplate: metro-ai-suite/smart-traffic-intersection-agent/docker/.env.template
+
+  # Container images
+  images:
+    - name: smart-traffic-intersection-agent
+      registry: docker.io/intel
+      tag: "2026.1.0"
+    - name: live-metrics-service
+      registry: docker.io/intel
+      tag: "2026.1.0"
+    - name: ovms
+      registry: docker.io/openvino/model_server
+      tag: "2026.1"
+
+# ── Configuration Parameters ──────────────────────────────────────────────────
+parameters:
+  - name: VLM_MODEL_NAME
+    description: HuggingFace model ID for the VLM
+    default: OpenVINO/Phi-3.5-vision-instruct-int8-ov
+    required: false
+
+  - name: VLM_TARGET_DEVICE
+    description: Inference device (CPU | GPU | NPU)
+    default: CPU
+    required: false
+
+  - name: INTERSECTION_NAME
+    description: Logical name for the intersection (used in MQTT topics)
+    default: intersection_1
+    required: false
+
+  - name: INTERSECTION_LATITUDE
+    description: GPS latitude of the intersection
+    default: "37.51358"
+    required: false
+
+  - name: INTERSECTION_LONGITUDE
+    description: GPS longitude of the intersection
+    default: "-122.25591"
+    required: false
+
+  - name: WEATHER_MOCK
+    description: Use mocked weather data instead of live API (true | false)
+    default: "false"
+    required: false
+
+  - name: REFRESH_INTERVAL
+    description: VLM analysis interval in seconds
+    default: "15"
+    required: false
+
+# ── Install Instructions ───────────────────────────────────────────────────────
+install:
+  quickstart: |
+    # 1. Clone or download
+    git clone https://github.com/intel/edge-ai-suites.git
+    cd edge-ai-suites/metro-ai-suite/smart-traffic-intersection-agent
+
+    # 2. Set up models
+    make setup
+
+    # 3. Deploy (Docker Compose)
+    make deploy
+
+  helm: |
+    helm install smart-traffic \
+      oci://ghcr.io/intel/oep-charts/smart-traffic-intersection-agent \
+      --version 2026.1.0-helm \
+      --set trafficAgent.env.vlmTargetDevice=GPU
+
+  oep_cli: |
+    oep install smart-traffic-intersection-agent
+    oep install smart-traffic-intersection-agent --set VLM_TARGET_DEVICE=GPU
+
+# ── Source & Docs ──────────────────────────────────────────────────────────────
+source:
+  repository: https://github.com/intel/edge-ai-suites
+  directory: metro-ai-suite/smart-traffic-intersection-agent
+  branch: main
+  readme: metro-ai-suite/smart-traffic-intersection-agent/README.md
+  license: Apache-2.0
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+changelog:
+  - version: 2026.1.0
+    date: "2026-06-27"
+    notes: Initial catalog publication

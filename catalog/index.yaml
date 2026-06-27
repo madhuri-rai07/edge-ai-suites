@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# OEP App Catalog Index
+# ---------------------
+# This file is the master index for all published OEP sample applications.
+# ODMs add entries here (via PR) when publishing new apps.
+# SIs use the `oep` CLI to search, inspect, and install apps from this index.
+#
+# Schema:
+#   apiVersion: catalog.oep.intel.com/v1
+#   entries: list of app stubs; full metadata lives in apps/<id>/manifest.yaml
+
+apiVersion: catalog.oep.intel.com/v1
+generated: "2026-06-27T00:00:00Z"
+
+entries:
+  - id: smart-traffic-intersection-agent
+    name: Smart Traffic Intersection Agent
+    version: 2026.1.0
+    suite: metro-ai-suite
+    publisher: Intel Corporation
+    description: >
+      Real-time traffic intersection analytics powered by Vision Language Model
+      (VLM) inference on Intel hardware. Provides density estimation, incident
+      detection, and a Gradio UI dashboard.
+    tags: [traffic, vlm, openvino, gradio, fastapi]
+    hardware: [CPU, GPU, NPU]
+    manifest: apps/smart-traffic-intersection-agent/manifest.yaml
+    updated: "2026-06-27"
