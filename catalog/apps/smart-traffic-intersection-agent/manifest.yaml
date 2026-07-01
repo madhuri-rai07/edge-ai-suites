@@ -124,6 +124,44 @@ parameters:
     default: "15"
     required: false
 
+# ── Install Handler ────────────────────────────────────────────────────────────
+# Declares how `oep install` should install this app.
+#
+# Supported handlers:
+#   setup_sh  — delegates to setup.sh (handles prereqs, RI clone, certs, compose)
+#   makefile  — delegates to `make deploy`
+#   compose   — plain `docker compose up -d` (no prereqs)
+#   helm      — `helm install` from OCI chart
+#
+installHandler: setup_sh
+
+# Lifecycle hooks — commands run by `oep install` at each phase.
+# Paths are relative to the app source directory (source.directory).
+lifecycle:
+  # prereqs: steps run before the main install (clone deps, certs, model download, etc.)
+  # For setup_sh handler these are already embedded inside setup.sh.
+  prereqs: null
+
+  # install: the main install command
+  install: "bash setup.sh --setup"
+
+  # start / stop / clean: operational commands after initial install
+  start:   "bash setup.sh --run"
+  stop:    "bash setup.sh --stop"
+  clean:   "bash setup.sh --clean"
+
+  # env_vars: variables the user must/can set before running install
+  env_vars:
+    required:
+      - name: VLM_MODEL_NAME
+        description: "HuggingFace model ID. E.g. OpenVINO/Phi-3.5-vision-instruct-int8-ov"
+    optional:
+      - name: VLM_TARGET_DEVICE
+        default: CPU
+        description: "CPU | GPU | NPU"
+      - name: HUGGINGFACE_TOKEN
+        description: "Required if downloading private/gated models"
+
 # ── Install Instructions ───────────────────────────────────────────────────────
 install:
   quickstart: |
