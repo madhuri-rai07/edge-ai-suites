@@ -55,16 +55,70 @@ _fetch() {
 _fetch_index() { _fetch "index.yaml"; }
 _fetch_manifest() { _fetch "apps/$1/manifest.yaml"; }
 
-# Fetch an artifact whose path is relative to the repo root (not the catalog dir)
-_fetch_artifact() {
-    local path="$1"
-    if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/$path" ]]; then
-        cat "$REPO_ROOT/$path"
-    elif [[ -n "$REPO_ROOT" ]]; then
-        _red "Artifact not found locally: $REPO_ROOT/$path"; return 1
-    else
-        curl -fsSL "$REPO_BASE/$path"
+# Convert a GitHub repo URL + branch into a raw.githubusercontent.com base URL,
+# e.g. https://github.com/org/name + main -> https://raw.githubusercontent.com/org/name/main
+_raw_base_for_repo() {
+    local repo="$1" branch="$2"
+    echo "${repo/github.com/raw.githubusercontent.com}/$branch"
+}
+
+# Resolve a local directory that contains the given app's source repo, so that
+# artifact paths declared in the manifest (which are relative to that app's
+# source.repository root, NOT necessarily this catalog's own repo) can be read.
+#
+# Apps can live in a different GitHub repo than the catalog itself (e.g. a
+# shared microservice published from edge-ai-libraries while the catalog lives
+# in edge-ai-suites) — this must not assume everything is co-located.
+#
+# Prints the resolved local root path to stdout; falls back to printing nothing
+# if no local checkout could be resolved (caller should then use the raw base URL).
+_resolve_source_root() {
+    local manifest="$1" app_dir="$2"
+
+    local src_dir; src_dir=$(echo "$manifest" | yq '.source.directory // ""' -r)
+    local repo;    repo=$(echo "$manifest" | yq '.source.repository // ""' -r)
+    local branch;  branch=$(echo "$manifest" | yq '.source.branch // "main"' -r)
+
+    # Already checked out as part of the current repo (e.g. running the CLI
+    # from inside edge-ai-suites and the app's source lives in this same repo).
+    if [[ -n "$REPO_ROOT" && -n "$src_dir" && -d "$REPO_ROOT/$src_dir" ]]; then
+        echo "$REPO_ROOT"
+        return 0
     fi
+
+    # Otherwise sparse-clone just the app's directory from its declared
+    # source repo (may be a different repo than the catalog's own).
+    [[ -z "$repo" || -z "$src_dir" ]] && return 1
+    if [[ ! -d "$app_dir/src/.git" ]]; then
+        _info "Cloning $repo (sparse: $src_dir) …" >&2
+        _require git
+        git clone --filter=blob:none --sparse --branch "$branch" "$repo" "$app_dir/src" >&2 2>&1 | sed 's/^/    /' >&2
+        git -C "$app_dir/src" sparse-checkout set "$src_dir" >&2
+    fi
+    echo "$app_dir/src"
+}
+
+# Fetch an artifact whose path is relative to the app's own source repo root
+# (declared via manifest source.repository/source.directory), not the catalog's
+# own repo root. Falls back to a raw.githubusercontent.com URL built from the
+# manifest's source.repository when no local checkout is available.
+_fetch_artifact() {
+    local path="$1" manifest="$2" app_dir="$3"
+
+    local root; root=$(_resolve_source_root "$manifest" "$app_dir") || true
+    if [[ -n "$root" && -f "$root/$path" ]]; then
+        cat "$root/$path"
+        return 0
+    fi
+
+    local repo;   repo=$(echo "$manifest" | yq '.source.repository // ""' -r)
+    local branch; branch=$(echo "$manifest" | yq '.source.branch // "main"' -r)
+    if [[ -n "$repo" ]]; then
+        curl -fsSL "$(_raw_base_for_repo "$repo" "$branch")/$path" && return 0
+    fi
+
+    _red "Artifact not found: $path"
+    return 1
 }
 
 # ── Commands ───────────────────────────────────────────────────────────────────
@@ -140,7 +194,7 @@ cmd_install() {
 
     case "$handler" in
         compose)   _install_compose  "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
-        helm)      _install_helm     "$app_id" "$manifest"            "${overrides[@]+"${overrides[@]}"}" ;;
+        helm)      _install_helm     "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
         setup_sh)  _install_setup_sh "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
         makefile)  _install_makefile "$app_id" "$manifest" "$app_dir" "${overrides[@]+"${overrides[@]}"}" ;;
         *)         _red "Unknown handler: $handler (compose | helm | setup_sh | makefile)"; exit 1 ;;
@@ -267,7 +321,7 @@ _install_compose() {
     local env_template; env_template=$(echo "$manifest" | yq '.artifacts.compose.envTemplate // ""' -r)
 
     _info "Fetching compose file …"
-    if ! _fetch_artifact "$compose_path" > "$app_dir/docker-compose.yaml"; then
+    if ! _fetch_artifact "$compose_path" "$manifest" "$app_dir" > "$app_dir/docker-compose.yaml"; then
         _red "Could not fetch compose file: $compose_path"; exit 1
     fi
 
@@ -293,16 +347,35 @@ _install_compose() {
 }
 
 _install_helm() {
-    local app_id="$1" manifest="$2"
-    shift 2
+    local app_id="$1" manifest="$2" app_dir="$3"
+    shift 3
     local overrides=("$@")
     _require helm
 
-    local chart_repo; chart_repo=$(echo "$manifest" | yq '.artifacts.helm.repository' -r)
-    local chart_name; chart_name=$(echo "$manifest" | yq '.artifacts.helm.chart' -r)
-    local chart_ver;  chart_ver=$(echo "$manifest" | yq '.artifacts.helm.version' -r)
+    local chart_repo;  chart_repo=$(echo "$manifest" | yq '.artifacts.helm.repository // ""' -r)
+    local chart_name;  chart_name=$(echo "$manifest" | yq '.artifacts.helm.chart' -r)
+    local chart_ver;   chart_ver=$(echo "$manifest" | yq '.artifacts.helm.version' -r)
+    local chart_local; chart_local=$(echo "$manifest" | yq '.artifacts.helm.localPath // ""' -r)
 
-    local helm_args=("install" "$app_id" "$chart_repo/$chart_name" "--version" "$chart_ver")
+    local chart_ref
+    if [[ -n "$chart_repo" ]]; then
+        # OCI/Helm-repo hosted chart (e.g. ghcr.io)
+        chart_ref="$chart_repo/$chart_name"
+    elif [[ -n "$chart_local" ]]; then
+        # Chart lives in the app's own source repo (may differ from the
+        # catalog's repo) — resolve it locally or sparse-clone it, same as
+        # the compose/setup_sh handlers do.
+        local root; root=$(_resolve_source_root "$manifest" "$app_dir") || true
+        if [[ -z "$root" || ! -d "$root/$chart_local" ]]; then
+            _red "Could not resolve chart path: $chart_local"; exit 1
+        fi
+        chart_ref="$root/$chart_local"
+    else
+        _red "Manifest declares no helm chart repository or localPath"; exit 1
+    fi
+
+    local helm_args=("install" "$app_id" "$chart_ref")
+    [[ -n "$chart_repo" ]] && helm_args+=("--version" "$chart_ver")
     for kv in "${overrides[@]+"${overrides[@]}"}"; do
         helm_args+=("--set" "$kv")
     done
