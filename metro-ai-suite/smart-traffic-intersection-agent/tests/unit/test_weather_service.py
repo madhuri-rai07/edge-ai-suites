@@ -810,6 +810,63 @@ class TestWeatherServiceFetchData:
             assert result.short_forecast == "Clear"
 
     @pytest.mark.asyncio
+    async def test_fetch_weather_data_overrides_stale_or_wrong_is_daytime(self):
+        """Regression test for ITEP-92089: the live NWS API path must not
+        blindly trust the forecast period's isDaytime flag. Even when NWS
+        reports isDaytime=False for the matched period, if it is actually
+        daytime right now at the given coordinates, the returned
+        WeatherData.is_daytime must reflect reality (True) - not the
+        possibly stale/mismatched API value."""
+        mock_config = Mock(spec=ConfigService)
+        mock_config.get_weather_config.return_value = {}
+
+        service = WeatherService(mock_config)
+
+        mock_points_response = Mock()
+        mock_points_response.json.return_value = {
+            "properties": {
+                "forecastHourly": "https://api.weather.gov/forecast/hourly"
+            }
+        }
+        mock_points_response.raise_for_status = Mock()
+
+        # Use a fixed, known-daytime UTC instant (noon UTC) at the equator/
+        # prime meridian so compute_is_daytime deterministically returns True,
+        # while the mocked NWS period claims isDaytime=False.
+        fixed_now = datetime(2024, 6, 21, 12, 0, tzinfo=timezone.utc)
+
+        mock_forecast_response = Mock()
+        mock_forecast_response.json.return_value = {
+            "properties": {
+                "periods": [{
+                    "name": "Current Hour",
+                    "temperature": 72,
+                    "temperatureUnit": "F",
+                    "shortForecast": "Clear",
+                    "detailedForecast": "Clear skies",
+                    "windSpeed": "5 mph",
+                    "windDirection": "N",
+                    "probabilityOfPrecipitation": {"value": 0},
+                    "isDaytime": False,  # Deliberately wrong/stale value from API
+                    "startTime": (fixed_now - timedelta(hours=1)).isoformat(),
+                    "endTime": (fixed_now + timedelta(hours=1)).isoformat()
+                }]
+            }
+        }
+        mock_forecast_response.raise_for_status = Mock()
+
+        with patch('requests.get') as mock_get, \
+             patch('src.services.weather_service.datetime') as mock_datetime:
+            mock_get.side_effect = [mock_points_response, mock_forecast_response]
+            mock_datetime.now.return_value = fixed_now
+            mock_datetime.fromisoformat = datetime.fromisoformat
+
+            result = await service._fetch_weather_data(0.0, 0.0)
+
+            assert result is not None
+            assert result.is_daytime is True
+
+    @pytest.mark.asyncio
     async def test_fetch_weather_data_request_error(self):
         """Test fetch handles request exceptions."""
         import requests

@@ -262,6 +262,16 @@ class WeatherService:
                 # Process weather data into WeatherData object
                 weather_data = self._process_weather_data(current_period)
 
+                # Recompute is_daytime from the real current time/coordinates
+                # rather than trusting the NWS period's isDaytime flag as-is.
+                # The matched forecast period can be stale or mismatched
+                # (e.g. no period bracketed "now" and periods[0] was used as
+                # a fallback, or the period boundaries don't line up exactly
+                # with real sunrise/sunset), which was causing the UI to
+                # show "Night time" while the camera feed was clearly in
+                # daylight (ITEP-92089).
+                weather_data.is_daytime = compute_is_daytime(lat, lon, now)
+
                 logger.debug("Weather data fetched successfully", 
                            conditions=weather_data.detailed_forecast,
                            temperature=weather_data.temperature,
