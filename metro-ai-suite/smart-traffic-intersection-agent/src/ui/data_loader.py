@@ -21,6 +21,22 @@ from config import Config
 logger = logging.getLogger(__name__)
 ui_update_queue = asyncio.Queue()
 
+# Cache of the most recently received monitoring data, kept so a live clock
+# timer can re-render the system-info panel with a fresh "Current Time" on
+# every tick, independent of how often new MQTT/WebSocket data actually
+# arrives (fixes ITEP-92089: UI clock appearing frozen between data pushes).
+latest_monitoring_data: Optional[MonitoringData] = None
+
+
+def get_latest_system_info_html(debug_mode=False) -> str:
+    """Synchronously build a fresh system-info panel using the last known
+    monitoring data, with an always-current "Current Time" value.
+
+    Intended to be called from a gr.Timer tick (which requires a sync
+    callback) so the clock keeps advancing even while waiting for new data.
+    """
+    return UIComponents.build_system_info_html(latest_monitoring_data)
+
 async def fetch_intersection_data(api_url: str = Config.get_api_url()) -> None:
     """
     Fetch data from the Traffic Intersection Agent API
@@ -70,6 +86,11 @@ async def update_components(debug_mode=False):
                 error_msg = "<div style='color: red; text-align: center; padding: 20px;'> 🤖 Waiting for Agent. This might take several seconds...</div>"
                 yield error_msg, [], error_msg, error_msg, error_msg, error_msg, gr.HTML(visible=False)
                 continue
+
+            # Cache the latest data so the live clock timer can keep the
+            # system-info panel's "Current Time" fresh between updates.
+            global latest_monitoring_data
+            latest_monitoring_data = data
 
             header = await UIComponents.create_header(data)
             camera_gallery = await UIComponents.create_camera_images(data)

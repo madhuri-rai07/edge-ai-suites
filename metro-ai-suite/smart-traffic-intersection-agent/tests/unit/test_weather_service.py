@@ -230,6 +230,49 @@ class TestWeatherServiceProcessing:
         assert result.wind_info == "12mph/SW"
 
 
+class TestComputeIsDaytime:
+    """Test cases for compute_is_daytime (ITEP-92089: day/night indicator
+    must reflect the real current time instead of a stale cached value)."""
+
+    def test_noon_utc_at_equator_is_daytime(self):
+        """Solar noon at the equator/prime meridian should always be daytime."""
+        from services.weather_service import compute_is_daytime
+
+        noon = datetime(2026, 6, 21, 12, 0, 0, tzinfo=timezone.utc)
+        assert compute_is_daytime(0.0, 0.0, noon) is True
+
+    def test_midnight_utc_at_equator_is_nighttime(self):
+        """Solar midnight at the equator/prime meridian should always be night."""
+        from services.weather_service import compute_is_daytime
+
+        midnight = datetime(2026, 6, 21, 0, 0, 0, tzinfo=timezone.utc)
+        assert compute_is_daytime(0.0, 0.0, midnight) is False
+
+    def test_naive_datetime_is_treated_as_utc(self):
+        """A naive datetime (no tzinfo) should be treated as UTC rather
+        than raising an error."""
+        from services.weather_service import compute_is_daytime
+
+        naive_noon = datetime(2026, 6, 21, 12, 0, 0)
+        assert compute_is_daytime(0.0, 0.0, naive_noon) is True
+
+    def test_defaults_to_now_when_no_time_given(self):
+        """When no explicit time is given, the function should use the
+        actual current time rather than any fixed/stale value."""
+        from services.weather_service import compute_is_daytime
+
+        # Should not raise, and should return a plain bool derived from now().
+        result = compute_is_daytime(37.7749, -122.4194)
+        assert isinstance(result, bool)
+
+    def test_polar_night_never_daytime(self):
+        """Near the poles in local winter, the sun may never rise."""
+        from services.weather_service import compute_is_daytime
+
+        winter_solstice = datetime(2026, 12, 21, 12, 0, 0, tzinfo=timezone.utc)
+        assert compute_is_daytime(89.0, 0.0, winter_solstice) is False
+
+
 class TestWeatherServiceMockData:
     """Test cases for mock weather data functionality."""
 
@@ -267,6 +310,7 @@ class TestWeatherServiceMockData:
         """Test loading mock weather from a valid JSON file."""
         mock_config = Mock(spec=ConfigService)
         mock_config.get_weather_config.return_value = {}
+        mock_config.get_intersection_coordinates.return_value = (37.7749, -122.4194)
         
         mock_exists.return_value = True
         mock_weather_data = {
@@ -292,6 +336,53 @@ class TestWeatherServiceMockData:
         assert result.is_mock is True
         assert result.temperature == 65
         assert result.name == "Mock Clear"
+
+    @patch('builtins.open')
+    @patch('os.path.exists')
+    def test_load_mock_weather_ignores_stale_hardcoded_is_daytime(self, mock_exists, mock_open):
+        """Regression test for ITEP-92089: the mock fixture's hardcoded,
+        frozen-in-time is_daytime/fetched_at values must NOT be used
+        verbatim. is_daytime should instead be computed from the real
+        current time and configured coordinates, and fetched_at should be
+        "now", not whatever moment the fixture happened to be captured."""
+        mock_config = Mock(spec=ConfigService)
+        mock_config.get_weather_config.return_value = {}
+        # Equator/prime-meridian at solar noon => unambiguously daytime,
+        # regardless of what the stale fixture claims.
+        mock_config.get_intersection_coordinates.return_value = (0.0, 0.0)
+
+        mock_exists.return_value = True
+        # Fixture deliberately claims it's night and frozen at an old date,
+        # to prove the service does not trust these stale fields blindly.
+        mock_weather_data = {
+            "clear": {
+                "name": "Mock Clear",
+                "temperature": 65,
+                "temperature_unit": "F",
+                "detailed_forecast": "Clear and sunny",
+                "is_precipitation": False,
+                "is_daytime": False,
+                "fetched_at": "2020-01-01T00:00:00Z",
+                "start_time": "2020-01-01T00:00:00Z",
+                "end_time": "2020-01-01T01:00:00Z",
+            }
+        }
+        mock_open.return_value.__enter__ = Mock(return_value=Mock(
+            read=Mock(return_value=json.dumps(mock_weather_data))
+        ))
+        mock_open.return_value.__exit__ = Mock(return_value=False)
+
+        before = datetime.now(timezone.utc)
+        with patch('json.load', return_value=mock_weather_data):
+            service = WeatherService(mock_config)
+            result = service._load_mock_weather_from_file(WeatherType.CLEAR)
+        after = datetime.now(timezone.utc)
+
+        # is_daytime must be recomputed (True at solar noon on equator),
+        # not the stale "False" baked into the fixture.
+        assert result.is_daytime is True
+        # fetched_at must be anchored to "now", not the frozen 2020 date.
+        assert before <= result.fetched_at <= after
 
 
 class TestWeatherServiceAsync:
@@ -882,6 +973,7 @@ class TestWeatherServiceMockDataExtended:
         """Test loading mock weather with string fetched_at timestamp."""
         mock_config = Mock(spec=ConfigService)
         mock_config.get_weather_config.return_value = {}
+        mock_config.get_intersection_coordinates.return_value = (37.7749, -122.4194)
         
         mock_exists.return_value = True
         mock_weather_data = {

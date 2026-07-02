@@ -11,7 +11,7 @@ import gradio as gr
 from fastapi import WebSocket, WebSocketDisconnect
 
 from config import Config
-from data_loader import update_components, fetch_intersection_data
+from data_loader import update_components, fetch_intersection_data, get_latest_system_info_html
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -482,7 +482,10 @@ def create_dashboard_interface():
                     rows=2,
                     height="450px",
                     container=True,
-                    object_fit="cover"
+                    object_fit="cover",
+                    # Enable the native fullscreen button so pedestrian
+                    # detections can be viewed enlarged (ITEP-92089).
+                    buttons=["fullscreen", "download"]
                 )
 
             with gr.Column(scale=1):
@@ -534,6 +537,16 @@ def create_dashboard_interface():
             fn=lambda x: gr.update(visible=x),
             inputs=debug_mode,
             outputs=debug_panel_component
+        )
+
+        # Live clock: refresh the system-info panel every second so
+        # "Current Time" keeps advancing independent of MQTT/WebSocket data
+        # cadence, instead of appearing frozen between updates (ITEP-92089).
+        clock_timer = gr.Timer(value=1, active=True)
+        clock_timer.tick(
+            fn=get_latest_system_info_html,
+            inputs=None,
+            outputs=system_info_component
         )
 
     return interface

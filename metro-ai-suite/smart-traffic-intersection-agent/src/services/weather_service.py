@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import math
 import os
 import requests
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,49 @@ from .config import ConfigService
 
 
 logger = structlog.get_logger(__name__)
+
+
+def compute_is_daytime(lat: float, lon: float, at_time: Optional[datetime] = None) -> bool:
+    """Compute whether it is currently daytime at the given coordinates.
+
+    Uses the standard NOAA sunrise/sunset approximation so day/night status
+    always reflects the actual current time instead of a stale cached value
+    (fixes ITEP-92089: day/night indicator not matching real time, e.g.
+    showing "night" during daylight hours).
+
+    Args:
+        lat: Latitude in degrees.
+        lon: Longitude in degrees.
+        at_time: Timezone-aware datetime to evaluate (defaults to now, UTC).
+
+    Returns:
+        True if it is daytime at the given time/location, False otherwise.
+    """
+    now = at_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    day_of_year = now.timetuple().tm_yday
+    lat_rad = math.radians(lat)
+
+    # Solar declination angle (radians)
+    declination = math.radians(23.44) * math.sin(math.radians(360 / 365 * (day_of_year - 81)))
+
+    # Hour angle at sunrise/sunset (degrees); guard against polar day/night
+    cos_hour_angle = -math.tan(lat_rad) * math.tan(declination)
+    if cos_hour_angle >= 1:
+        return False  # Polar night: sun never rises
+    if cos_hour_angle <= -1:
+        return True  # Polar day: sun never sets
+    hour_angle = math.degrees(math.acos(cos_hour_angle))
+
+    # Solar noon in UTC hours, corrected for longitude
+    solar_noon_utc = 12 - (lon / 15)
+    sunrise_utc = solar_noon_utc - (hour_angle / 15)
+    sunset_utc = solar_noon_utc + (hour_angle / 15)
+
+    current_hour_utc = now.hour + now.minute / 60 + now.second / 3600
+    return sunrise_utc <= current_hour_utc <= sunset_utc
 
 
 class WeatherService:
@@ -266,16 +310,21 @@ class WeatherService:
                     data = json.load(f)
                 data = data.get(weather_type.value, {})
 
-                # Parse fetched_at if it's a string
-                fetched_at = data.get("fetched_at")
-                if isinstance(fetched_at, str):
-                    try:
-                        fetched_at = datetime.fromisoformat(fetched_at.replace('Z', '+00:00'))
-                    except:
-                        fetched_at = datetime.now(timezone.utc)
-                else:
-                    fetched_at = datetime.now(timezone.utc)
-                
+                # The mock fixture's own fetched_at/start_time/end_time are
+                # frozen at whatever moment they were captured (e.g. Oct
+                # 2025). Using them verbatim causes the UI to display a
+                # stale, unrelated moment in time. Always anchor mock data
+                # to "now" instead.
+                now = datetime.now(timezone.utc)
+                fetched_at = now
+
+                # Compute is_daytime from the real current time and the
+                # configured intersection coordinates rather than trusting
+                # the fixture's hardcoded value (fixes ITEP-92089: day/night
+                # indicator mismatched with actual current time).
+                lat, lon = self.config_service.get_intersection_coordinates()
+                is_daytime = compute_is_daytime(lat, lon, now)
+
                 weather_data = WeatherData(
                     name=data.get("name", "Mock Data"),
                     temperature=data.get("temperature", 72),
@@ -291,9 +340,9 @@ class WeatherService:
                     precipitation_prob=float(data.get("precipitation_prob", 0)),
                     dewpoint=data.get("dewpoint"),
                     relative_humidity=data.get("relative_humidity"),
-                    is_daytime=data.get("is_daytime"),
-                    start_time=data.get("start_time"),
-                    end_time=data.get("end_time"),
+                    is_daytime=is_daytime,
+                    start_time=now.isoformat(),
+                    end_time=(now + timedelta(hours=1)).isoformat(),
                     weather_type=weather_type
                 )
                 logger.info("Loaded mock weather data from file",

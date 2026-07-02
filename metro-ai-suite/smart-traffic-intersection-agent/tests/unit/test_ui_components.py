@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for UI components."""
 
+import asyncio
 import pytest
 from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import os, sys
 # Add src/ui to path so ui_components and its siblings can be found
@@ -485,25 +486,26 @@ class TestUIComponentsCreateAlertsPanel:
 
 
 class TestUIComponentsCreateCameraImages:
-    """Test cases for create_camera_images method."""
+    """Test cases for create_camera_images method (includes ITEP-92089
+    stale/frozen feed indicator mitigation)."""
 
     def test_create_camera_images_without_data(self):
         """Test create_camera_images returns empty list when no data."""
-        result = UIComponents.create_camera_images(None)
-        
+        result = asyncio.run(UIComponents.create_camera_images(None))
+
         assert result == []
 
     def test_create_camera_images_with_data(self, sample_monitoring_data):
         """Test create_camera_images returns image list."""
-        result = UIComponents.create_camera_images(sample_monitoring_data)
-        
+        result = asyncio.run(UIComponents.create_camera_images(sample_monitoring_data))
+
         # Should have images for cameras with image_base64 set
         assert len(result) > 0
 
     def test_create_camera_images_returns_tuples(self, sample_monitoring_data):
         """Test create_camera_images returns list of tuples."""
-        result = UIComponents.create_camera_images(sample_monitoring_data)
-        
+        result = asyncio.run(UIComponents.create_camera_images(sample_monitoring_data))
+
         for item in result:
             assert isinstance(item, tuple)
             assert len(item) == 2
@@ -517,10 +519,48 @@ class TestUIComponentsCreateCameraImages:
                 "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
             }
         }
-        
-        result = UIComponents.create_camera_images(sample_monitoring_data)
-        
+
+        result = asyncio.run(UIComponents.create_camera_images(sample_monitoring_data))
+
         assert len(result) == 1
+
+    def test_create_camera_images_flags_stale_feed(self, sample_monitoring_data):
+        """A camera image with an old timestamp should be flagged as STALE
+        (ITEP-92089 mitigation for the frozen/not-moving video symptom)."""
+        stale_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        sample_monitoring_data.camera_images = {
+            "north_camera": {
+                "camera_id": "cam1",
+                "direction": "north",
+                "timestamp": stale_timestamp,
+                "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            }
+        }
+
+        result = asyncio.run(UIComponents.create_camera_images(sample_monitoring_data))
+
+        assert len(result) == 1
+        _, caption = result[0]
+        assert "STALE" in caption
+
+    def test_create_camera_images_fresh_feed_not_flagged(self, sample_monitoring_data):
+        """A camera image with a recent timestamp should not be flagged as
+        stale."""
+        fresh_timestamp = datetime.now(timezone.utc).isoformat()
+        sample_monitoring_data.camera_images = {
+            "north_camera": {
+                "camera_id": "cam1",
+                "direction": "north",
+                "timestamp": fresh_timestamp,
+                "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+            }
+        }
+
+        result = asyncio.run(UIComponents.create_camera_images(sample_monitoring_data))
+
+        assert len(result) == 1
+        _, caption = result[0]
+        assert "STALE" not in caption
 
 
 class TestUIComponentsCreateCameraGridHtml:
@@ -569,36 +609,55 @@ class TestUIComponentsCreateCameraGridHtml:
 
 
 class TestUIComponentsCreateSystemInfo:
-    """Test cases for create_system_info method."""
+    """Test cases for create_system_info / build_system_info_html (ITEP-92089 clock sync)."""
 
     def test_create_system_info_without_data(self):
-        """Test create_system_info shows offline when no data."""
-        with patch('data_loader.get_last_update_time', return_value=None):
-            result = UIComponents.create_system_info(None)
-            
-            assert "OFFLINE" in result
-            assert "System Status" in result
+        """Test build_system_info_html shows offline when no data."""
+        result = UIComponents.build_system_info_html(None)
+
+        assert "OFFLINE" in result
+        assert "System Status" in result
 
     def test_create_system_info_with_data(self, sample_monitoring_data):
-        """Test create_system_info shows online with data."""
-        with patch('data_loader.get_last_update_time', return_value="2025-01-01 10:00:00 UTC"):
-            result = UIComponents.create_system_info(sample_monitoring_data)
-            
-            assert "ONLINE" in result
-            assert "System Status" in result
+        """Test build_system_info_html shows online with data."""
+        result = UIComponents.build_system_info_html(sample_monitoring_data)
+
+        assert "ONLINE" in result
+        assert "System Status" in result
 
     def test_create_system_info_contains_version(self):
-        """Test create_system_info contains version info."""
-        result = UIComponents.create_system_info(None)
-        
+        """Test build_system_info_html contains version info."""
+        result = UIComponents.build_system_info_html(None)
+
         assert "RSU Monitor v1.0" in result
 
     def test_create_system_info_shows_current_time(self):
-        """Test create_system_info shows current time."""
-        result = UIComponents.create_system_info(None)
-        
+        """Test build_system_info_html shows current time in UTC."""
+        result = UIComponents.build_system_info_html(None)
+
         assert "Current Time" in result
         assert "UTC" in result
+
+    def test_create_system_info_current_time_is_live(self):
+        """Test that the rendered 'Current Time' reflects the actual
+        current UTC time (not a stale/cached value), confirming the clock
+        is computed fresh on every render (ITEP-92089)."""
+        before = datetime.now(timezone.utc)
+        result = UIComponents.build_system_info_html(None)
+        after = datetime.now(timezone.utc)
+
+        # Extract the rendered timestamp and ensure it falls within the
+        # window bounding this call, proving it's live rather than frozen.
+        rendered_time_str = before.strftime("%Y-%m-%d %H:%M")
+        assert rendered_time_str in result or after.strftime("%Y-%m-%d %H:%M") in result
+
+    def test_create_system_info_async_wrapper_matches_sync_builder(self, sample_monitoring_data):
+        """Test the async create_system_info wrapper delegates to the sync
+        builder used by the live clock timer, so both paths stay consistent."""
+        async_result = asyncio.run(UIComponents.create_system_info(sample_monitoring_data))
+
+        assert "ONLINE" in async_result
+        assert "Current Time" in async_result
 
 
 class TestMonitoringDataMethods:
