@@ -42,3 +42,16 @@ entries:
     hardware: [CPU, GPU, NPU]
     manifest: apps/model-download/manifest.yaml
     updated: "2026-07-02"
+  - id: odm-example-app
+    name: ODM Example App Microservice
+    version: 2026.1.0
+    suite: shared-microservices
+    publisher: Intel Corporation
+    description: >
+      Centralized microservice for downloading AI/ML models from multiple
+      model hubs (HuggingFace, Intel Geti, etc.), with optional format
+      conversion. Used as a prerequisite by other Gen AI sample applications.
+    tags: [odm-example-app, huggingface, geti, ovms, fastapi]
+    hardware: [CPU, GPU, NPU]
+    manifest: apps/odm-example-app/manifest.yaml
+    updated: "2026-07-02"

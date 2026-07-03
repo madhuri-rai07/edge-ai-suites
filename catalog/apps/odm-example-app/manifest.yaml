@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# App Manifest: ODM Example App Microservice
+# ------------------------------------------
+# Full metadata for this app. Referenced by catalog/index.yaml.
+# ODMs fill in this file when publishing; SIs read it via `oep info`.
+
+apiVersion: catalog.oep.intel.com/v1
+kind: AppManifest
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+id: odm-example-app
+name: ODM Example App
+version: 2026.1.0
+appVersion: "1.0.0"
+suite: shared-microservices
+publisher:
+  name: Intel Corporation
+  contact: oep-catalog@intel.com
+
+# ── Description ───────────────────────────────────────────────────────────────
+description: >
+  Centralized microservice for downloading AI/ML models from multiple model
+  hubs (HuggingFace, Intel Geti, and others), with optional format conversion.
+  Acts as a shared prerequisite for other Gen AI sample applications.
+
+longDescription: |
+  The ODM Example App Microservice provides a single, consistent way for
+  applications to fetch models rather than each app implementing its own
+  download logic. It supports:
+
+  Key capabilities:
+    - Downloads from HuggingFace Hub (with optional gated/private model auth)
+    - Downloads from Intel Geti projects/workspaces
+    - Optional model format conversion (e.g. for OpenVINO Model Server)
+    - Pluggable download backends via ENABLED_PLUGINS
+    - Can run as a long-lived service or a one-shot ephemeral container
+    - Helm chart and Docker Compose deployment options
+
+tags: [odm-example-app, huggingface, geti, ovms, fastapi]
+category: Shared Infrastructure / Model Management
+
+# ── Hardware & OS Requirements ────────────────────────────────────────────────
+requirements:
+  hardware:
+    - label: CPU
+      note: Required; download/conversion runs on CPU
+    - label: GPU
+      optional: true
+      note: Only relevant if the target consuming app uses GPU inference
+    - label: NPU
+      optional: true
+      note: Only relevant if the target consuming app uses NPU inference
+  os:
+    - ubuntu-22.04
+    - ubuntu-24.04
+  software:
+    - docker >= 24.0
+    - docker-compose-plugin >= 2.20
+    - python >= 3.10          # only required when building from source
+    - helm >= 3.12             # only for Kubernetes deployment
+
+# ── Artifacts ─────────────────────────────────────────────────────────────────
+artifacts:
+  # Helm chart (Kubernetes)
+  helm:
+    chart: odm-example-app-chart
+    version: 2026.1.0-helm
+    localPath: microservices/odm-example-app/chart
+
+  # Docker Compose (single-node / dev)
+  compose:
+    localPath: microservices/odm-example-app/docker/compose.yaml
+
+  # Container images
+  images:
+    - name: odm-example-app
+      registry: docker.io/intel
+      tag: "2026.1.0"
+
+# ── Configuration Parameters ──────────────────────────────────────────────────
+parameters:
+  - name: ENABLED_PLUGINS
+    description: Comma-separated list of download backends to enable (or "all")
+    default: all
+    required: false
+
+  - name: MODEL_PATH
+    description: Host path mounted into the container for storing downloaded models
+    default: "~/models"
+    required: false
+
+  - name: HUGGINGFACEHUB_API_TOKEN
+    description: HuggingFace token; required only for gated/private models
+    default: ""
+    required: false
+
+  - name: GETI_HOST
+    description: Intel Geti server host, required only when using the Geti plugin
+    default: ""
+    required: false
+
+  - name: GETI_TOKEN
+    description: Intel Geti API token, required only when using the Geti plugin
+    default: ""
+    required: false
+
+  - name: MAX_UPLOAD_SIZE_MB
+    description: Maximum upload size accepted by the service, in MB
+    default: "500"
+    required: false
+
+# ── Install Handler ────────────────────────────────────────────────────────────
+# Declares how `oep install` should install this app.
+#
+# Supported handlers:
+#   setup_sh  — delegates to setup.sh (handles prereqs, RI clone, certs, compose)
+#   makefile  — delegates to `make deploy`
+#   compose   — plain `docker compose up -d` (no prereqs)
+#   helm      — `helm install` from OCI chart
+#
+installHandler: compose
+
+# Lifecycle hooks — commands run by `oep install` at each phase.
+# Paths are relative to the app source directory (source.directory).
+lifecycle:
+  # prereqs: steps run before the main install (clone deps, certs, model download, etc.)
+  prereqs: null
+
+  # install: the main install command
+  install: "docker compose -f docker/compose.yaml up -d --build"
+
+  # start / stop / clean: operational commands after initial install
+  start:   "docker compose -f docker/compose.yaml up -d"
+  stop:    "docker compose -f docker/compose.yaml down"
+  clean:   "docker compose -f docker/compose.yaml down -v"
+
+  # env_vars: variables the user must/can set before running install
+  env_vars:
+    required: []
+    optional:
+      - name: ENABLED_PLUGINS
+        default: all
+        description: "Which model-hub backends to enable (huggingface, geti, ...)"
+      - name: MODEL_PATH
+        default: "~/models"
+        description: "Host directory to store downloaded models"
+      - name: HUGGINGFACEHUB_API_TOKEN
+        description: "Required only for gated/private HuggingFace models"
+      - name: GETI_HOST
+        description: "Required only when downloading from Intel Geti"
+      - name: GETI_TOKEN
+        description: "Required only when downloading from Intel Geti"
+
+# ── Install Instructions ───────────────────────────────────────────────────────
+install:
+  quickstart: |
+    # 1. Clone or download
+    git clone https://github.com/open-edge-platform/edge-ai-libraries.git
+    cd edge-ai-libraries/microservices/odm-example-app
+
+    # 2. Deploy (Docker Compose)
+    docker compose -f docker/compose.yaml up -d --build
+
+  helm: |
+    helm install odm-example-app \
+      ./chart \
+      --version 2026.1.0-helm \
+      --set env.enabledPlugins=all
+
+  oep_cli: |
+    oep install odm-example-app
+    oep install odm-example-app --set ENABLED_PLUGINS=huggingface
+
+# ── Source & Docs ──────────────────────────────────────────────────────────────
+source:
+  repository: https://github.com/open-edge-platform/edge-ai-libraries
+  directory: microservices/odm-example-app
+  branch: main
+  readme: microservices/odm-example-app/README.md
+  license: Apache-2.0
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+changelog:
+  - version: 2026.1.0
+    date: "2026-07-02"
+    notes: Initial catalog publication
