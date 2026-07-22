@@ -51,6 +51,21 @@ def _on_message(client, userdata, msg):
                 det = obj.get("detection", {})
                 label = det.get("label") or obj.get("roi_type", "unknown")
                 confidence = float(det.get("confidence", 0.0))
+                # Try to find label and confidence in classification/* or detection/* keys
+                label = "unknown"
+                confidence = 0.0
+
+                for key in obj.keys():
+                    if key.startswith("classification/") or key == "detection":
+                        output = obj.get(key, {})
+                        label = output.get("label", label)
+                        confidence = float(output.get("confidence", confidence))
+                        break
+
+                # Fallback to roi_type if still unknown
+                if label == "unknown":
+                    label = obj.get("roi_type", "unknown")
+
                 detections.append({
                     "frame_id":   frame_id,
                     "label":      label,
@@ -59,7 +74,7 @@ def _on_message(client, userdata, msg):
                     "y":          int(obj.get("y", 0)),
                     "width":      int(obj.get("w", obj.get("width", 0))),
                     "height":     int(obj.get("h", obj.get("height", 0))),
-                    "metadata":   json.dumps(det.get("bounding_box", {})),
+                    "metadata":   json.dumps({}),
                 })
         elif isinstance(payload, list):
             detections = payload

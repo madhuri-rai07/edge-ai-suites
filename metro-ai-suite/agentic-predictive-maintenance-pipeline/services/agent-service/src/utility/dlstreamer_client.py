@@ -31,10 +31,16 @@ _TIMEOUT = 5
 
 # Maps a UI-selectable device name to the pipeline definition that runs
 # gvadetect on that device (see configs/pipeline-server-config.json).
+def _normalize_pipeline_name(name: str) -> str:
+    """Normalize pipeline name delimiters to match DL Streamer config ids."""
+    return name.strip().replace("-", "_")
+
+
+_PIPELINE_NAME = _normalize_pipeline_name(_PIPELINE_NAME)
 _PIPELINE_NAME_BY_DEVICE = {
-    "CPU": os.environ.get("DLSTREAMER_PIPELINE_NAME_CPU", "pipeline_defect_detection"),
-    "GPU": os.environ.get("DLSTREAMER_PIPELINE_NAME_GPU", "pipeline_defect_detection_gpu"),
-    "NPU": os.environ.get("DLSTREAMER_PIPELINE_NAME_NPU", "pipeline_defect_detection_npu"),
+    "CPU": _normalize_pipeline_name(os.environ.get("DLSTREAMER_PIPELINE_NAME_CPU", _PIPELINE_NAME)),
+    "GPU": _normalize_pipeline_name(os.environ.get("DLSTREAMER_PIPELINE_NAME_GPU", f"{_PIPELINE_NAME}_gpu")),
+    "NPU": _normalize_pipeline_name(os.environ.get("DLSTREAMER_PIPELINE_NAME_NPU", f"{_PIPELINE_NAME}_npu")),
 }
 
 _NO_PROXY_HOSTS = {"no_proxy": "dlstreamer-pipeline-server,localhost,127.0.0.1"}
