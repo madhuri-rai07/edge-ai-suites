@@ -582,8 +582,18 @@ print_all_service_host_endpoints() {
 }
 
 get_dlsps_pipeline_api_base() {
+    local nginx_container
     local https_port
-    https_port=$(docker port nginx-reverse-proxy 443 2>/dev/null | grep -v '^\[' | head -1 | cut -d: -f2)
+
+    nginx_container=$(docker ps --format '{{.Names}}' | grep -E "^${PROJECT_NAME}.*nginx-reverse-proxy" | head -1)
+    if [ -z "$nginx_container" ]; then
+        nginx_container=$(docker ps --format '{{.Names}}' | grep -E 'nginx-reverse-proxy$' | head -1)
+    fi
+
+    if [ -n "$nginx_container" ]; then
+        https_port=$(docker port "$nginx_container" 443 2>/dev/null | grep -v '^\[' | head -1 | cut -d: -f2)
+    fi
+
     if [ -z "$https_port" ]; then
         https_port=443
     fi
@@ -631,10 +641,10 @@ get_si_rtsp_stream_path() {
     local camera_number="$1"
 
     case "$camera_number" in
-        1) echo "north" ;;
-        2) echo "east" ;;
-        3) echo "south" ;;
-        4) echo "west" ;;
+        1) echo "camera1" ;;
+        2) echo "camera2" ;;
+        3) echo "camera3" ;;
+        4) echo "camera4" ;;
         *)
             echo -e "${RED}ERROR: Unsupported camera number: ${camera_number}${NC}"
             return 1
