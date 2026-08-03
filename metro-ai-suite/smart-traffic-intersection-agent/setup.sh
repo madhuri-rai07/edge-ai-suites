@@ -44,6 +44,10 @@ CLONE_PATH="$APP_DIR/$CLONE_DIR"
 export DEPS_DIR="$CLONE_PATH/metro-ai-suite/metro-vision-ai-app-recipe"
 export RI_DIR="$DEPS_DIR/$SAMPLE_APP"
 export OVMS_CONFIG_DIR="${APP_DIR}/.ovms"
+export SI_SETUP_REPO_URL="${SI_SETUP_REPO_URL:-https://github.com/svamsik/edge-ai-suites.git}"
+export SI_SETUP_BRANCH="${SI_SETUP_BRANCH:-svamsik/si-rtsp-config}"
+export RTSP_STREAM_IP="${RTSP_STREAM_IP:-${SI_RTSP_HOST:-}}"
+export RTSP_STREAM_PORT="${RTSP_STREAM_PORT:-8554}"
 
 if [ "$ENABLE_TC" = "true" ]; then
     TC_OVERLAY_AGENT="-f ${APP_DIR}/docker/tc-overlay-agent.yaml"
@@ -82,6 +86,8 @@ if [ "$#" -eq 0 ] || ([ "$#" -eq 1 ] && [ "$1" = "--help" ]); then
     echo -e "${YELLOW}USAGE: ${GREEN}source setup.sh ${BLUE}[--setenv | --setup | --run | --restart [agent|deps|all] | --stop | --clean | --help]"
     echo -e "${YELLOW}"
     echo -e "  --setenv:                 Set environment variables without building image or starting any containers"
+    echo -e "                              • RTSP_STREAM_IP or SI_RTSP_HOST enables RTSP-backed Smart Intersection pipelines"
+    echo -e "                              • RTSP_STREAM_PORT sets the RTSP server port (default: 8554)"
     echo -e "  --build:                  Build the service images without starting containers"
     echo -e "  --setup:                  Build and run the services"
     echo -e "  --run:                    Start the services without building image (if already built)"
@@ -193,8 +199,8 @@ check_and_setup_dependencies() {
         # Run git clone to fetch the dependencies (sparse, shallow)
         echo -e "${YELLOW}Dependencies not found. Cloning repository...${NC}"
         git clone --filter=blob:none --sparse --depth 1 \
-            --branch release-2026.0.0 \
-            https://github.com/open-edge-platform/edge-ai-suites.git \
+            --branch "$SI_SETUP_BRANCH" \
+            "$SI_SETUP_REPO_URL" \
             "$CLONE_PATH"
         git -C "$CLONE_PATH" sparse-checkout set metro-ai-suite/metro-vision-ai-app-recipe
 
@@ -250,7 +256,45 @@ check_and_setup_dependencies() {
         rm "$APP_DIR/docker/ri-compose.yaml" 2> /dev/null
         ln -sf "$DEPS_DIR/docker-compose.yml" "$APP_DIR/docker/ri-compose.yaml"
     fi
+
+    verify_si_rtsp_config || return 1
     return 0
+}
+
+validate_rtsp_stream_config() {
+    if [ -z "$RTSP_STREAM_IP" ]; then
+        return 0
+    fi
+
+    if ! [[ "$RTSP_STREAM_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo -e "${RED}ERROR: RTSP_STREAM_IP/SI_RTSP_HOST must be an IP address or hostname.${NC}"
+        return 1
+    fi
+
+    if ! [[ "$RTSP_STREAM_PORT" =~ ^[0-9]+$ ]] || [ "$RTSP_STREAM_PORT" -lt 1 ] || [ "$RTSP_STREAM_PORT" -gt 65535 ]; then
+        echo -e "${RED}ERROR: RTSP_STREAM_PORT must be a TCP port between 1 and 65535.${NC}"
+        return 1
+    fi
+}
+
+verify_si_rtsp_config() {
+    if [ -z "$RTSP_STREAM_IP" ]; then
+        return 0
+    fi
+
+    validate_rtsp_stream_config || return 1
+
+    local dlstreamer_config="${RI_DIR}/src/dlstreamer-pipeline-server/config.json"
+    if [ ! -f "$dlstreamer_config" ]; then
+        echo -e "${RED}ERROR: DLStreamer Pipeline Server config not found: $dlstreamer_config${NC}"
+        return 1
+    fi
+
+    if ! grep -q 'rtsp_server' "$dlstreamer_config"; then
+        echo -e "${RED}ERROR: Smart Intersection DLSPS config does not contain rtsp_server support.${NC}"
+        echo -e "${YELLOW}Remove ${CLONE_PATH} or set SI_SETUP_REPO_URL/SI_SETUP_BRANCH to the RTSP-enabled SI setup branch, then rerun setup.${NC}"
+        return 1
+    fi
 }
 
 # Verify dependencies and setup (skip if stopping/cleaning services or only showing help or setting env vars)
@@ -537,6 +581,106 @@ print_all_service_host_endpoints() {
     echo -e
 }
 
+get_dlsps_pipeline_api_base() {
+    local https_port
+    https_port=$(docker port nginx-reverse-proxy 443 2>/dev/null | grep -v '^\[' | head -1 | cut -d: -f2)
+    if [ -z "$https_port" ]; then
+        https_port=443
+    fi
+
+    printf 'https://localhost:%s/api/pipelines' "$https_port"
+}
+
+wait_for_dlsps_api() {
+    local api_base="$1"
+    local timeout="${DLSPS_START_TIMEOUT:-120}"
+    local elapsed=0
+
+    echo -e "${BLUE}==> Waiting for DLStreamer Pipeline Server API at ${api_base} ...${NC}"
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if curl -k -s --noproxy '*' --fail "${api_base}/status" >/dev/null; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    echo -e "${RED}ERROR: DLStreamer Pipeline Server API was not reachable within ${timeout}s.${NC}"
+    return 1
+}
+
+build_si_rtsp_pipeline_payload() {
+    local camera_number="$1"
+    local stream_path
+
+    stream_path=$(get_si_rtsp_stream_path "$camera_number") || return 1
+
+    cat <<EOF
+{
+  "rtsp_server": "rtsp://${RTSP_STREAM_IP}:${RTSP_STREAM_PORT}/${stream_path}",
+  "parameters": {
+    "camera_config": {
+      "cameraid": "camera${camera_number}"
+    }
+  }
+}
+EOF
+}
+
+get_si_rtsp_stream_path() {
+    local camera_number="$1"
+
+    case "$camera_number" in
+        1) echo "north" ;;
+        2) echo "east" ;;
+        3) echo "south" ;;
+        4) echo "west" ;;
+        *)
+            echo -e "${RED}ERROR: Unsupported camera number: ${camera_number}${NC}"
+            return 1
+            ;;
+    esac
+}
+
+start_si_dlsps_rtsp_pipelines() {
+    if [ -z "$RTSP_STREAM_IP" ]; then
+        return 0
+    fi
+
+    validate_rtsp_stream_config || return 1
+
+    local api_base
+    api_base=$(get_dlsps_pipeline_api_base)
+    wait_for_dlsps_api "$api_base" || return 1
+
+    echo -e "${BLUE}==> Starting Smart Intersection DLStreamer pipelines with RTSP source ${RTSP_STREAM_IP}:${RTSP_STREAM_PORT} ...${NC}"
+    for camera_number in 1 2 3 4; do
+        local pipeline_name="intersection-cam${camera_number}"
+        local payload
+        local response
+        local http_code
+        local response_body
+        local stream_path
+
+        stream_path=$(get_si_rtsp_stream_path "$camera_number") || return 1
+        payload=$(build_si_rtsp_pipeline_payload "$camera_number") || return 1
+        response=$(curl -k -s --noproxy '*' -w "\nHTTP_CODE:%{http_code}" \
+            "${api_base}/user_defined_pipelines/${pipeline_name}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+        http_code=$(printf '%s\n' "$response" | awk -F: '/^HTTP_CODE:/ {print $2}' | tail -1)
+        response_body=$(printf '%s\n' "$response" | sed '/^HTTP_CODE:/d')
+        if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+            echo -e "${RED}ERROR: Failed to start ${pipeline_name}. HTTP ${http_code}: ${response_body}${NC}"
+            return 1
+        fi
+
+        echo -e "${GREEN}Started ${pipeline_name} from rtsp://${RTSP_STREAM_IP}:${RTSP_STREAM_PORT}/${stream_path}.${NC}"
+    done
+}
+
 # Prepare OVMS model on the host (export if not already present)
 prepare_ovms_model() {
     # Determine weight format (auto-detect based on device if not user-specified)
@@ -592,6 +736,7 @@ build_and_start_service() {
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}Smart-Traffic-Intersection-Agent Services built and started successfully!${NC}"
+        start_si_dlsps_rtsp_pipelines || return 1
         print_all_service_host_endpoints
     else
         echo -e "${RED}Failed to build and start Smart-Traffic-Intersection-Agent Services${NC}"
@@ -611,6 +756,7 @@ start_service() {
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}Smart-Traffic-Intersection-Agent Services started successfully!${NC}"
+        start_si_dlsps_rtsp_pipelines || return 1
         print_all_service_host_endpoints
     else
         echo -e "${RED}Failed to start Smart-Traffic-Intersection-Agent Services${NC}"
@@ -673,6 +819,7 @@ restart_service() {
 
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}Dependencies restarted successfully!${NC}"
+                start_si_dlsps_rtsp_pipelines || return 1
                 print_all_service_host_endpoints
             else
                 echo -e "${RED}Failed to restart dependencies!${NC}"
@@ -701,6 +848,7 @@ restart_service() {
 
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}All dependencies and Backend/UI services for Traffic Intersection Agent restarted successfully!${NC}"
+                start_si_dlsps_rtsp_pipelines || return 1
             else
                 echo -e "${RED}Failed to restart dependencies and Backend/UI services!${NC}"
                 return 1
