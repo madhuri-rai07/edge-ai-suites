@@ -26,3 +26,6 @@ services:
     ports: !override
       - ":80"
       - ":443"
+  broker:
+    ports: !override
+      - "1883:1883"
