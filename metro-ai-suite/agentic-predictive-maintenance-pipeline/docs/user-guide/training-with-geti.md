@@ -68,6 +68,64 @@ For example:
 
 Update the `model=` value for each device-specific pipeline if your model path changes.
 
+### Add a Model-Proc File (Geti/OTX Exports)
+
+Models exported from Intel Geti (OTX) typically emit detections as two separate output tensors,
+`boxes` and `labels`, rather than the single `DetectionOutput` layer that `gvadetect` expects by
+default. Without a matching model-proc file, DL Streamer fails to start inference with an error
+similar to:
+
+```text
+ToROIConverter "SSD" is not implemented.
+```
+
+To fix this, create a model-proc JSON file next to the model, using the `boxes_labels` converter
+and your label list in the same order used during Geti training:
+
+```json
+{
+  "json_schema_version": "2.2.0",
+  "input_preproc": [],
+  "output_postproc": [
+    {
+      "converter": "boxes_labels",
+      "labels": ["Rupture", "Deformation", "Disconnect", "Obstacle"]
+    }
+  ]
+}
+```
+
+Reference the file with `model-proc=` in every CPU/GPU/NPU `gvadetect` pipeline entry, for example:
+
+```json
+"pipeline": "{auto_source} name=source ! decodebin3 ! gvadetect model=/home/pipeline-server/models/pipeline-defect-detection.xml model-proc=/home/pipeline-server/models/pipeline-defect-detection.json device=CPU threshold=0.4 name=detection ! gvametaconvert add-empty-results=true name=metaconvert ! queue ! gvafpscounter ! appsink name=destination"
+```
+
+### Reshape Dynamic Input Models
+
+Some Geti/OTX exports have a dynamic input shape (for example `[1,?,?,3]`) to support their
+built-in letterbox preprocessing. DL Streamer's default CPU preprocessing backend requires a
+static input shape and fails with an error similar to:
+
+```text
+Check 'model_shape()[model_width_idx].is_static()' failed ... Dynamic resize: Model width dimension shall be static
+```
+
+If your exported model has a dynamic input, reshape it to a static shape before deployment,
+using the training resolution recorded in the model's `rt_info` (look for `orig_width`/
+`orig_height`), for example:
+
+```python
+import openvino as ov
+
+core = ov.Core()
+model = core.read_model("pipeline-defect-detection.xml")
+model.reshape({model.inputs[0].get_any_name(): [1, 640, 640, 3]})  # match your training resolution
+ov.save_model(model, "pipeline-defect-detection.xml")
+```
+
+Then deploy the reshaped `.xml`/`.bin` pair as described above.
+
 ## Update APM Configuration
 
 The detector labels must stay aligned with the reasoning and fallback configuration:

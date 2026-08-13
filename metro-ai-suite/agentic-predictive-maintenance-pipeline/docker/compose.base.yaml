@@ -49,7 +49,7 @@ services:
     container_name: apm-mqtt-broker
     hostname: mqtt-broker
     ports:
-      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_HOST_PORT:-1883}:1883"
     volumes:
       - ../config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     networks:
