@@ -257,6 +257,7 @@ check_and_setup_dependencies() {
         ln -sf "$DEPS_DIR/docker-compose.yml" "$APP_DIR/docker/ri-compose.yaml"
     fi
 
+	export SUPASS=$(cat "$RI_DIR/src/secrets/supass")
     verify_si_rtsp_config || return 1
     return 0
 }
