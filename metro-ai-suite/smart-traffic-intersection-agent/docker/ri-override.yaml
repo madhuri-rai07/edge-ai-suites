@@ -23,9 +23,9 @@ services:
   # No ports override — base compose already uses ephemeral ports ("80", "443").
   nginx:
     container_name: ${INTERSECTION_NAME:-trafficagent}-nginx-reverse-proxy
-    ports: !override
-      - ":80"
-      - ":443"
+    # ports: !override
+    #   - ":80"
+    #   - ":443"
   broker:
     ports: !override
       - "1883:1883"
