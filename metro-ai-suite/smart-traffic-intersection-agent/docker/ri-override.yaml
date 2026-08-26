@@ -20,12 +20,14 @@ services:
 
   # Override hardcoded container_name so each STIA instance gets a unique nginx
   # container name scoped to its INTERSECTION_NAME project.
-  # No ports override — base compose already uses ephemeral ports ("80", "443").
   nginx:
     container_name: ${INTERSECTION_NAME:-trafficagent}-nginx-reverse-proxy
-    # ports: !override
-    #   - ":80"
-    #   - ":443"
+    ports: !override
+      - ":80"
+      - ":443"
+    volumes: !override
+      - "${APP_DIR}/docker/nginx.conf.template:/etc/nginx/nginx.conf.template:ro"
+      - "${RI_DIR}/src/nginx/ssl:/etc/nginx/ssl:ro"
   broker:
     ports: !override
-      - "1883:1883"
+      - ":1883"
