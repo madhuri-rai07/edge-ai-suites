@@ -75,9 +75,45 @@ needing upload.
 | Service | image_ref (from compose) | source | Notes |
 |---|---|---|---|
 | `ovms-service` | `openvino/model_server:2026.1` | `external_url` (as-is) or push to hosted registry | Public OpenVINO image; ISV's choice |
-| `traffic-agent` | built from `src/Dockerfile` | `hosted_registry` | Preferred — enables click-to-accept gating; get push credentials via `POST .../push-credentials` |
-| `live-metrics-service` | built from a sibling `live-video-analysis/live-metrics-service` path | `hosted_registry` | Same as above |
+| `traffic-agent` | built from `src/Dockerfile` | `hosted_registry` | Preferred — enables click-to-accept gating; see push mechanism below |
+| `live-metrics-service` | built from a sibling `live-video-analysis/live-metrics-service` path | `hosted_registry` | Same push mechanism as `traffic-agent` |
 | `collector` | `docker.io/intel/vippet-collector:2026.0.0` | `external_url` | Docker Hub image — lower-trust flag applies (§8) |
+
+### How the `hosted_registry` push actually works (concrete, for `traffic-agent`)
+The catalog never builds anything itself — it only provisions a private ECR
+repo and issues short-lived push credentials for it. The ISV still builds
+and pushes the image exactly like any other ECR workflow:
+
+1. **ISV builds the image** themselves, in their own CI or locally — the
+   catalog does not run this build:
+   ```bash
+   docker build -t traffic-agent:1.0.0 ./src
+   ```
+2. **ISV requests push credentials**:
+   `POST /apps/{appId}/versions/{versionId}/images/{imageId}/push-credentials`
+   → `{ registry_uri, repository, auth_token, expires_at }` — a short-lived
+   ECR auth token scoped to a repo the catalog pre-provisioned, e.g.
+   `<catalog-registry>/<isv-org-slug>/smart-traffic-intersection-agent/traffic-agent`.
+3. **ISV logs in with the temp token** (standard ECR docker-login pattern):
+   ```bash
+   echo "<auth_token>" | docker login --username AWS --password-stdin <registry_uri>
+   ```
+4. **ISV tags and pushes**:
+   ```bash
+   docker tag traffic-agent:1.0.0 <registry_uri>/<repository>:1.0.0
+   docker push <registry_uri>/<repository>:1.0.0
+   ```
+5. **Catalog detects the push asynchronously** — an ECR EventBridge rule
+   fires a webhook back to the catalog, which sets
+   `app_version_images.source = hosted_registry`, updates
+   `registry_or_url` to the real pushed tag/digest, and queues the async
+   vulnerability-scan job (Trivy/ECR native scan). **The ISV never calls an
+   explicit "I pushed" API** — this step is event-driven, not
+   request/response, which is why step 8 (submit) can be blocked on
+   `scan_status: passed` without the ISV needing to poll anything manually
+   in between (the Storefront UI polls/displays scan status for them).
+6. Same mechanism applies to `live-metrics-service` — separate
+   `push-credentials` call, separate repo, same 5 steps.
 
 ## 5. Settings (env vars)
 `PUT /apps/{appId}/versions/{versionId}/settings` — bulk upsert. Key entries

@@ -81,6 +81,28 @@ same generic rejection message, logged to `audit_logs` with reason
 **Preconditions:** user authenticated with role ISV, belongs to an
 `organizations` row of `org_type = ISV`.
 
+**UX note (compared to ESH's single-form onboarding):** the numbered steps
+below are the *backend* API sequence, not a mandate for a 7-screen wizard.
+The Storefront should present this as **two screens**, not seven:
+- **Screen 1 (the "form")**: name, category, description, tags, icon,
+  license, and the compose file upload, submitted together in one POST
+  round-trip from the ISV's point of view (client-side sequences steps
+  1–4 automatically: create draft app → get pre-signed upload URLs →
+  upload → parse). The ISV fills one form and clicks "Continue" once.
+- **Screen 2 (the "finish details")**: everything `parse-deployment`
+  extracted, pre-filled with sensible defaults (image source defaults to
+  `hosted_registry` with inline `docker login/tag/push` instructions
+  already generated per service; settings default `fill_at_install=false`
+  unless the key name matches a secret-like pattern, e.g. `*_TOKEN`/`*_KEY`,
+  in which case `is_secret=true` is pre-checked). ISV only has to touch
+  fields that need a real value or a correction, then adds hardware
+  requirements + evidence, and clicks "Submit for review" once.
+- This keeps the trust boundary from §4 unchanged — the ISV still builds
+  and pushes their own image (catalog never executes ISV build scripts,
+  unlike an ESH/Jenkins-style build-from-source pipeline) — it only removes
+  *screen count*, not API calls. The numbered steps below map 1:1 to what
+  the two screens trigger under the hood.
+
 1. ISV clicks "New App" in ISV dashboard → Storefront opens onboarding
    wizard, step 1: **listing details**.
 2. Step 1 — Listing details: ISV enters name, category (enum: Retail,

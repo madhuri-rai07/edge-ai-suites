@@ -258,6 +258,15 @@ capabilities/limitations (see §11.2).
 
 ### 4.3 Onboarding / Submission Service (ISV-facing)
 - Wizard: create draft app → app_version → upload deployment file.
+- **UX target is 2 screens, not a long multi-step wizard**: screen 1
+  (listing details + compose file upload, submitted together) and screen 2
+  (auto-extracted images/settings/hardware reqs, pre-filled with sensible
+  defaults, ISV corrects only what needs it, then submits). This keeps the
+  ISV-builds-and-pushes trust boundary (no ESH/Jenkins-style build-from-source
+  on catalog infra) while matching the low perceived friction of a
+  single-form onboarding — see `technical-flows.md` §B1 for the detailed
+  screen-to-API mapping *(new — [CORRECTED], addresses "onboarding feels
+  too lengthy" feedback)*.
 - MVP primarily targets a **single Docker Compose file**; bare-metal executable
   packaging is a stated target category but out of scope for TP1
   *(new nuance — [CORRECTED])*.
