@@ -12,6 +12,16 @@ info:
     loopback trust/cert-provisioning decision. Every operation here has a
     documented TP1 manual-CLI fallback in `technical-flows.md` (flows
     D2-D5) for use before the Device Agent ships.
+
+    NOTE on the install/upgrade model: the browser only ever relays an
+    opaque, short-lived, single-use `install_token` — it never carries the
+    actual install payload. The Device Agent redeems that token itself,
+    over its own normal OUTBOUND HTTPS call to the Catalog Service
+    (`GET /install/redeem/{installToken}` in catalog-service.openapi.yaml,
+    ordinary public-CA TLS, no custom PKI/signing). This keeps the loopback
+    leg simple (just relay a meaningless-if-stolen token) and avoids
+    needing KMS-based manifest signing + public-key provisioning to every
+    device.
 servers:
   - url: "https://127.0.0.1:{port}/local/v1"
     description: Loopback-only; port and cert are provisioned per design §3.1.1
@@ -47,13 +57,14 @@ paths:
     post:
       tags: [lifecycle]
       summary: >
-        Accept a signed install manifest, verify its signature and
-        expiry, pull images, and start the app (flow D2 steps 5-8).
+        Accept an opaque install token from the browser, redeem it directly
+        against the Catalog Service (own outbound HTTPS call, not shown to
+        the browser), then pull images and start the app (flow D2 steps 5-8).
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/SignedManifest" }
+            schema: { $ref: "#/components/schemas/InstallTokenRequest" }
       responses:
         "202":
           description: Accepted — install running asynchronously
@@ -61,12 +72,12 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/InstallJob" }
         "400":
-          description: Malformed manifest
+          description: Malformed request
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
-          description: Manifest signature invalid or expired (flow D2 step 6 error case)
+          description: Token redeem failed — expired, already consumed, or unknown (flow D2 step 6 error case)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -78,16 +89,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: >
+            Redeemed plan has unfilled fill_at_install settings — response
+            body carries `needs_input`; caller should prompt the SI and
+            re-call /install with a freshly-issued token (the first token
+            is already consumed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NeedsInputResponse" }
 
   /upgrade:
     post:
       tags: [lifecycle]
-      summary: Upgrade an installed app to a new signed manifest/version (flow D3 steps 2-3)
+      summary: Upgrade an installed app using a new install token (flow D3 steps 2-3)
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/SignedManifest" }
+            schema: { $ref: "#/components/schemas/InstallTokenRequest" }
       responses:
         "202":
           description: Accepted — upgrade running asynchronously
@@ -100,7 +120,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
-          description: Manifest signature invalid or expired
+          description: Token redeem failed — expired, already consumed, or unknown
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -113,7 +133,9 @@ paths:
   /uninstall:
     post:
       tags: [lifecycle]
-      summary: Stop and remove an installed app and its resources (flow D4 steps 2-4)
+      summary: >
+        Stop and remove an installed app and its resources (flow D4 steps
+        2-4). Purely local — no token needed, does not reach Catalog Service.
       requestBody:
         required: true
         content:
@@ -155,7 +177,7 @@ paths:
   /install/{jobId}/status:
     get:
       tags: [lifecycle]
-      summary: Poll async install/upgrade/uninstall job status (flows D2 step 7, D3 step 3, D4 step 3)
+      summary: Poll async install/upgrade/uninstall job status (flows D2 step 8, D3 step 3, D4 step 3)
       parameters:
         - name: jobId
           in: path
@@ -185,6 +207,9 @@ components:
         TLS/cert trust and (where applicable) Private Network Access
         preflight — see design §3.1.1. This is NOT a substitute for the
         underlying loopback cert mechanism, which is still under decision.
+        Since the token itself is opaque and single-use, a malicious local
+        page hitting this port at worst triggers a redeem of a token it
+        doesn't possess — it cannot forge or replay a valid install.
 
   schemas:
     Error:
@@ -204,35 +229,37 @@ components:
         memory_gb: { type: integer }
         device_agent_version: { type: string }
 
-    SignedManifest:
+    InstallTokenRequest:
       type: object
-      description: Identical shape to the SignedManifest returned by the Catalog Service's POST /install (see catalog-service.openapi.yaml)
+      required: [install_token]
       properties:
-        manifest_id: { type: string, format: uuid }
-        app_version_id: { type: string, format: uuid }
-        compose_url: { type: string, format: uri }
-        images:
+        install_token:
+          type: string
+          description: >
+            Opaque, single-use, short-lived token issued by the Catalog
+            Service's POST /install (or /upgrade path re-uses the same
+            issuance flow). The Device Agent redeems this itself against
+            `GET /install/redeem/{installToken}` — see
+            catalog-service.openapi.yaml — before proceeding.
+        settings_overrides:
           type: array
-          items:
-            type: object
-            properties:
-              service_name: { type: string }
-              image_ref: { type: string }
-              pull_token: { type: string, nullable: true }
-        settings:
-          type: array
+          description: Values for fill_at_install settings collected from the SI on a retry
           items:
             type: object
             properties:
               env_key: { type: string }
               value: { type: string }
-        license_terms_url: { type: string, format: uri }
-        compatibility_rules:
-          type: object
-          additionalProperties: true
-        signature: { type: string }
-        issued_at: { type: string, format: date-time }
-        expires_at: { type: string, format: date-time }
+
+    NeedsInputResponse:
+      type: object
+      properties:
+        needs_input:
+          type: array
+          items:
+            type: object
+            properties:
+              env_key: { type: string }
+              description: { type: string }
 
     InstallJob:
       type: object
@@ -242,7 +269,7 @@ components:
         action: { type: string, enum: [install, upgrade, uninstall] }
         state:
           type: string
-          enum: [queued, pulling_images, starting, running, completed, failed, rolled_back]
+          enum: [queued, redeeming_token, pulling_images, starting, running, completed, failed, rolled_back]
         progress_pct: { type: integer, minimum: 0, maximum: 100 }
         error_message: { type: string, nullable: true }
         started_at: { type: string, format: date-time }

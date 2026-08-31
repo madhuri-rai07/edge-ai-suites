@@ -558,8 +558,12 @@ paths:
     post:
       tags: [catalog]
       summary: >
-        Issue a signed install manifest for one app_version + system profile,
-        gated by license acceptance (flow D2 steps 3-4, D3 step 2).
+        Issue an opaque, short-lived, single-use install token for one
+        app_version + system profile, gated by license acceptance (flow D2
+        steps 3-4, D3 step 2). This endpoint does NOT return the install
+        payload itself — the token is meaningless until the Device Agent
+        redeems it via GET /install/redeem/{installToken} over its own
+        outbound connection (see device-agent.openapi.yaml).
       requestBody:
         required: true
         content:
@@ -567,10 +571,10 @@ paths:
             schema: { $ref: "#/components/schemas/InstallRequest" }
       responses:
         "200":
-          description: Signed manifest issued
+          description: Install token issued
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SignedManifest" }
+              schema: { $ref: "#/components/schemas/InstallTokenResponse" }
         "428":
           description: License not yet accepted — client must call accept-license then retry
           content:
@@ -582,15 +586,47 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  /install/{manifestId}/telemetry:
+  /install/redeem/{installToken}:
+    get:
+      tags: [catalog]
+      summary: >
+        Called by the Device Agent itself (never the browser), over a
+        normal outbound HTTPS connection — ordinary public-CA trust, no
+        custom PKI/signing involved. Validates the token is unexpired and
+        unused, marks it consumed, and returns the real install plan
+        (flow D2 step 6).
+      parameters:
+        - name: installToken
+          in: path
+          required: true
+          schema: { type: string }
+      security: []
+      responses:
+        "200":
+          description: Install plan returned; token is now consumed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallPlan" }
+        "404":
+          description: Unknown token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: Token expired or already consumed (single-use)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /install/{installTokenId}/telemetry:
     post:
       tags: [catalog]
       summary: Optional aggregate install/upgrade/uninstall telemetry ping (flow D2 step 9, D3 step 4, D4 step 5)
       parameters:
-        - name: manifestId
+        - name: installTokenId
           in: path
           required: true
-          schema: { type: string, format: uuid }
+          schema: { type: string }
       requestBody:
         required: true
         content:
@@ -602,7 +638,7 @@ paths:
                 action: { type: string, enum: [install, upgrade, uninstall] }
                 result: { type: string, enum: [success, failure] }
       responses:
-        "202": { description: Accepted (fire-and-forget, no device identity retained) }
+        "202": { description: "Accepted (fire-and-forget, no device identity retained)" }
 
 components:
   securitySchemes:
@@ -951,13 +987,23 @@ components:
               env_key: { type: string }
               value: { type: string }
 
-    SignedManifest:
+    InstallTokenResponse:
       type: object
       description: >
-        Returned synchronously by POST /install; relayed by the Storefront/CLI
-        to the local Device Agent over loopback (flow D2 step 5).
+        Returned synchronously by POST /install; the Storefront/CLI relays
+        only this opaque token to the local Device Agent over loopback
+        (flow D2 step 4-5) — it carries no install payload itself.
       properties:
-        manifest_id: { type: string, format: uuid }
+        install_token: { type: string, description: "opaque, single-use, short-lived" }
+        expires_in: { type: integer, description: "seconds until the token expires unredeemed" }
+
+    InstallPlan:
+      type: object
+      description: >
+        Returned by GET /install/redeem/{installToken}, called directly by
+        the Device Agent over its own outbound HTTPS connection (flow D2
+        step 6) — never seen by the browser.
+      properties:
         app_version_id: { type: string, format: uuid }
         compose_url: { type: string, format: uri, description: "pre-signed S3 URL" }
         images:
@@ -979,6 +1025,4 @@ components:
         compatibility_rules:
           type: object
           additionalProperties: true
-        signature: { type: string, description: "base64, signed with catalog's KMS asymmetric key" }
         issued_at: { type: string, format: date-time }
-        expires_at: { type: string, format: date-time }

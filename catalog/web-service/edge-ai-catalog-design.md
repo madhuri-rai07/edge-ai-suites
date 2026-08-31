@@ -53,15 +53,19 @@ is an Intel-only role.
    │       ▼                                    ▼                     │
    │  ┌───────────────────┐              ┌───────────────────────┐    │
    │  │ Catalog Service     │◄────────────┤ Device Agent (local)    │    │
-   │  │ (cloud, Tier 2)     │  fetches     │  - answers SystemProfile│   │
-   │  │ - listings, review  │  signed      │    query from browser   │   │
-   │  │ - issues signed      │  manifest    │  - verifies signed      │   │
-   │  │   manifest on        │─────────────►│    manifest (relayed by │   │
-   │  │   /install request   │  (browser    │    the browser)          │   │
-   │  └───────────────────┘   relays it)   │  - hands signed plan to │    │
-   │                                       │    OEP Installer         │   │
-   │                                       └──────────┬──────────────┘    │
-   │                                                  │ signed plan       │
+   │  │ (cloud, Tier 2)     │  browser     │  - answers SystemProfile│   │
+   │  │ - listings, review  │  relays an   │    query from browser   │   │
+   │  │ - issues opaque      │  opaque      │  - receives token from  │   │
+   │  │   one-time install   │  install     │    browser, redeems it  │   │
+   │  │   token on /install   │  token       │    itself (outbound)    │   │
+   │  │   request             │─────────────►│  - hands install plan  │   │
+   │  │ - redeem endpoint     │◄─────────────┤    to OEP Installer     │   │
+   │  │   returns real plan   │  agent's OWN │                         │   │
+   │  │   directly to agent   │  outbound    │                         │   │
+   │  │   (normal outbound     │  HTTPS call  │                         │   │
+   │  │   HTTPS, no PKI)       │  (redeem)   │                         │   │
+   │  └───────────────────┘              └──────────┬──────────────┘    │
+   │                                                  │ install plan       │
    │                                       ┌──────────▼──────────────┐    │
    │                                       │  OEP Installer            │    │
    │                                       │  (existing bootstrap tool)│   │
@@ -78,13 +82,21 @@ Service never needs inbound reachability to the device. Sequence:
 1. Browser (Storefront) loads from the Intel-hosted domain.
 2. Browser asks the local Device Agent (loopback) for a SystemProfile.
 3. Browser calls Catalog Service `POST /install {app_version_id, system_profile}`.
-4. Catalog Service returns a **signed manifest** to the browser (same HTTPS
-   response — no separate cloud→device leg needed).
-5. Browser hands the manifest to the Device Agent over the same loopback
-   connection; Device Agent verifies the signature + compatibility locally.
-6. Device Agent hands a signed plan to the OEP Installer, which pulls
-   artifacts and runs `docker compose up`.
-7. Device Agent reports status back to the browser (loopback); browser shows
+4. Catalog Service does the license/entitlement/compatibility checks and
+   returns a **short-lived, single-use opaque install token** to the browser
+   (same HTTPS response) — **not** the install payload itself.
+5. Browser hands the token to the Device Agent over the same loopback
+   connection (`POST /local/install {install_token}`).
+6. Device Agent redeems the token itself, over its own normal **outbound**
+   HTTPS connection to Catalog Service (`GET /install/redeem/{install_token}`)
+   — ordinary public-CA-trusted TLS, no custom signing/PKI involved. Catalog
+   Service validates the token (unexpired, unused), marks it consumed, and
+   returns the real install plan (compose file URL, image refs, settings,
+   license terms, compatibility rules) directly to the Device Agent. Device
+   Agent checks the SystemProfile it already has against the plan's
+   compatibility rules **locally**, then hands the plan to the OEP Installer.
+7. OEP Installer pulls artifacts and runs `docker compose up`.
+8. Device Agent reports status back to the browser (loopback); browser shows
    "App available" and optionally posts an aggregate install-telemetry event
    to Catalog Service — no per-device record is created or retained.
 
@@ -139,9 +151,13 @@ two browsers named in the source deck (Chrome, Edge).
 **d) Defense-in-depth on the Device Agent side.** Since the loopback port is
 technically reachable by any local process/tab on that machine, Device Agent
 should still (i) validate the `Origin` header strictly equals the known
-catalog domain, and (ii) only act on manifests carrying the Catalog Service's
-**signature** (§4.5) — so even a malicious local page hitting the port cannot
-forge a valid install request.
+catalog domain, and (ii) never act on a bare token's *contents* — the token
+is opaque and meaningless on its own; the actual install plan only exists
+after the Device Agent independently redeems it over its own outbound HTTPS
+connection to Catalog Service (§4.5). So even a malicious local page hitting
+the loopback port can, at worst, get the Device Agent to redeem a token it
+doesn't itself possess — it cannot forge or replay a valid install (tokens
+are single-use and short-lived server-side).
 
 **Illustrative sequence:**
 ```
@@ -153,9 +169,15 @@ Browser (https://catalog.intel.com)
 Device Agent (127.0.0.1:47100, loopback-only)
    │ validates Origin header, responds with SystemProfile
    ▼
-Browser → POST /install to Catalog Service (normal internet) → signed manifest
-Browser → POST manifest to Device Agent over the same loopback HTTPS connection
-Device Agent verifies manifest signature → hands plan to OEP Installer
+Browser → POST /install to Catalog Service (normal internet) → opaque
+          short-lived install_token (not the install payload)
+Browser → POST {install_token} to Device Agent over the same loopback
+          HTTPS connection
+Device Agent → GET /install/redeem/{install_token} to Catalog Service
+          (normal OUTBOUND internet, ordinary public-CA TLS — no PKI
+          bootstrapping needed) → real install plan returned directly
+Device Agent verifies plan's compatibility rules locally → hands plan to
+          OEP Installer
 ```
 
 ### 3.2 Full 3-tier component view (target state, includes future Federation)
@@ -165,14 +187,14 @@ Device Agent verifies manifest signature → hands plan to OEP Installer
 ┌───────────────────────┐          ┌─────────────────────────────────┐     ┌───────────────────────────┐
 │  Storefront (browser  │  HTTPS   │      Catalog Service (cloud)     │     │   Device Agent            │
 │  SPA)                 │◄────────►│  REST API + MCP | DB | Container │     │   - reports SystemProfile │
-│                       │  Catalog │  Registry | Hosted Artifacts     │     │   - verifies signed       │
-│  CLI (`eaictl`)       │  API     │                                   │     │     manifest              │
-└──────────┬────────────┘          └───────────────┬─────────────────┘     │   - hands signed plan to  │
+│                       │  Catalog │  Registry | Hosted Artifacts     │     │   - redeems install token │
+│  CLI (`eaictl`)       │  API     │                                   │     │     directly (outbound)   │
+└──────────┬────────────┘          └───────────────┬─────────────────┘     │   - hands install plan to │
            │  loopback HTTPS (cert)                 │ (future: direct       │     OEP Installer         │
-           │  SystemProfile, install trigger         │  cloud→agent leg,     │   - manages app lifecycle │
+           │  SystemProfile, install trigger token   │  cloud→agent leg,     │   - manages app lifecycle │
            └─────────────────────────────────────────┼  not needed for v1) ─►│                           │
                                                        │                      └──────────┬────────────────┘
-                                          Federation   │                                 │ signed plan
+                                          Federation   │                                 │ install plan
                                        (signed indexes,│                      ┌──────────▼────────────────┐
                                           future)      │                      │   OEP Installer            │
                                     ┌──────────────────▼──────┐               │   (existing module/profile │
@@ -188,17 +210,18 @@ Device Agent verifies manifest signature → hands plan to OEP Installer
 **Tier 1 — Catalog UI/UX**: Storefront (browser SPA) and CLI `eaictl`, both
 first-class clients talking to the Catalog Service over HTTPS/REST/MCP, and to
 the local Device Agent over **HTTPS loopback with a cert** for system profiling
-and install triggering.
+and passing along the opaque install token.
 
 **Tier 2 — Catalog Cloud Service**: REST API + MCP, Catalog DB, Container
 Registry, Hosted Artifacts, and (future) Federation with Partner Catalogs via
 signed indexes. This is the tier implemented on AWS (§9).
 
-**Tier 3 — Edge Runtime**: **Device Agent** (reports system profile, verifies
-signed install manifests, orchestrates app lifecycle) **and the existing OEP
+**Tier 3 — Edge Runtime**: **Device Agent** (reports system profile, redeems
+install tokens directly with Catalog Service over its own outbound HTTPS
+connection, orchestrates app lifecycle) **and the existing OEP
 Installer** (module/profile-based bootstrap engine — the same tool reviewed
 separately in this workstream) which performs the actual dependency/app
-installation once handed a signed plan by the Device Agent. **[CORRECTED]** —
+installation once handed the install plan by the Device Agent. **[CORRECTED]** —
 the previous draft conflated these into one generic "device agent that runs
 docker compose"; the real design keeps them as two distinct, collaborating
 components, and Tier 3 still depends on the existing OEP Installer's
@@ -255,26 +278,34 @@ capabilities/limitations (see §11.2).
 - Suspend/Resume/Remove available any time on Listed apps (reasons out of scope
   of this document, owned by catalog governance).
 
-### 4.5 Install Orchestration (v1: browser-relayed, single-device, no fleet) *(rewritten — [CONFIRMED])*
-No persistent device registry, and — for v1 — **no direct cloud→device leg at
-all**. The Storefront browser, running on the same edge device the SI is
-installing onto, is the sole relay between Catalog Service and the local
-Device Agent (see §3.1 for the full sequence):
+### 4.5 Install Orchestration (v1: browser-triggered, single-device, no fleet) *(rewritten — [CONFIRMED])*
+No persistent device registry. The Storefront browser, running on the same
+edge device the SI is installing onto, only *triggers* the install — it never
+carries the actual install payload (compose file, image refs, settings). The
+Device Agent fetches that itself directly from Catalog Service, over its own
+normal **outbound** HTTPS connection (ordinary public-CA trust, no custom
+PKI/signing needed) — see §3.1 for the full sequence:
 1. Storefront queries the local **Device Agent via loopback** for a fresh
    **SystemProfile** (hardware, OS, Edge Pack version).
 2. Storefront calls Catalog Service: `POST /install {app_version_id, system_profile}`.
-3. Catalog Service builds a **signed manifest** (app compose + image refs +
-   settings + license terms + compatibility rules) and returns it **in the same
-   HTTPS response** to the Storefront — no separate agent-facing channel needed.
-4. Storefront hands the manifest to the Device Agent over the loopback
-   connection. Device Agent **verifies the manifest's signature** and checks
-   the SystemProfile against the manifest's compatibility rules **locally**.
-5. Device Agent provisions prerequisites (drivers, container runtime, udev
-   rules) if needed, then hands a **signed plan** to the **OEP Installer**.
-6. OEP Installer pulls images from the registry (or the ISV-provided URL),
+3. Catalog Service does the license/entitlement/compatibility checks and
+   returns a **short-lived, single-use opaque install token** (not the
+   install payload) **in the same HTTPS response** to the Storefront.
+4. Storefront hands the token to the Device Agent over the loopback
+   connection (`POST /local/install {install_token}`).
+5. Device Agent redeems the token itself — `GET /install/redeem/{install_token}`
+   over its own outbound HTTPS call to Catalog Service. Catalog Service
+   validates the token (unexpired, unused), marks it consumed, and returns
+   the real install plan (compose file URL, image refs, settings, license
+   terms, compatibility rules) directly to the Device Agent. Device Agent
+   checks the SystemProfile against the plan's compatibility rules
+   **locally** before proceeding.
+6. Device Agent provisions prerequisites (drivers, container runtime, udev
+   rules) if needed, then hands the install plan to the **OEP Installer**.
+7. OEP Installer pulls images from the registry (or the ISV-provided URL),
    renders/injects settings, and runs `docker compose up` with declared device
    passthrough.
-7. Status flows back: OEP Installer → Device Agent → Storefront (loopback) →
+8. Status flows back: OEP Installer → Device Agent → Storefront (loopback) →
    user ("App available"); Storefront optionally posts an aggregate
    install-telemetry event to Catalog Service.
 - **Upgrade/Uninstall**: same browser-relayed flow; Device Agent instructs OEP
@@ -385,19 +416,24 @@ installable until the new one is approved.
 - `POST /admin/invitations`
 - `PUT /admin/users/{id}/roles`
 
-**SI (v1: browser-relayed, no device registry)**
+**SI (v1: browser triggers, Device Agent fetches directly, no device registry)**
 - `GET /catalog?category=&search=&isv=&geo=`
 - `GET /catalog/apps/{id}`
-- `POST /install {app_version_id, system_profile}` → returns signed manifest
-  synchronously in the response (browser relays it to the local Device Agent)
-- `POST /install/{manifest_id}/telemetry` → optional aggregate success/failure
+- `POST /install {app_version_id, system_profile}` → returns an opaque,
+  short-lived, single-use `install_token` synchronously in the response
+  (browser relays only this token to the local Device Agent)
+- `GET /install/redeem/{install_token}` → called by the **Device Agent itself**
+  (normal outbound HTTPS, not by the browser) to fetch the real install plan;
+  server validates the token is unexpired/unused and marks it consumed
+- `POST /install/{token_id}/telemetry` → optional aggregate success/failure
   ping (no device identity retained)
 
 **Storefront/CLI ↔ Device Agent** (local loopback only, HTTPS + cert — the only
 device-facing channel needed in v1)
 - `GET /local/system-profile`
-- `POST /local/install {manifest}` (verify signature/compatibility, install via OEP Installer)
-- `POST /local/upgrade {manifest}` / `POST /local/uninstall {app_version_id}`
+- `POST /local/install {install_token}` (Device Agent redeems the token itself,
+  then installs via OEP Installer)
+- `POST /local/upgrade {install_token}` / `POST /local/uninstall {app_version_id}`
 - `GET /local/installed-apps` (local status/health, for "view installed apps")
 
 ## 8. Cross-Cutting Concerns
@@ -407,9 +443,11 @@ device-facing channel needed in v1)
 - **Image sourcing**: catalog-hosted registry (preferred, enables click-to-accept
   gating) or ISV-provided external URL (weaker gating guarantee — flagged to
   Intel admin at review time).
-- **Compatibility check**: performed **locally by the Device Agent** against a
-  signed manifest, not solely a server-side rule match — avoids trusting an
-  install grant the device itself hasn't independently verified.
+- **Compatibility check**: performed **locally by the Device Agent** against
+  the install plan it fetched directly from Catalog Service (not by trusting
+  the browser's relayed data), and also pre-checked server-side before the
+  install token is issued — avoids trusting an install grant the device
+  itself hasn't independently verified.
 - **Observability**: audit_logs for every admin/lifecycle action;
   install_telemetry_events for aggregate adoption metrics.
 
@@ -420,14 +458,14 @@ device-facing channel needed in v1)
 | Concern | AWS Service | Notes |
 |---|---|---|
 | SSO / Login | **Amazon Cognito** federated with Intel IdP via SAML/OIDC | Invite-only user pools match allowlist requirement |
-| API layer | **API Gateway** + **ECS Fargate** (or Lambda for lighter endpoints) | v1: plain request/response only — `POST /install` returns the signed manifest synchronously to the browser; no WebSocket/long-poll needed since there's no direct cloud→device leg |
+| API layer | **API Gateway** + **ECS Fargate** (or Lambda for lighter endpoints) | v1: plain request/response only — `POST /install` returns an opaque install token synchronously to the browser; the Device Agent separately calls `GET /install/redeem/{token}` outbound to fetch the real plan; no WebSocket/long-poll needed since there's no direct cloud→device leg |
 | App/version/user metadata | **Amazon RDS (Postgres)** | Relational integrity for lifecycle states |
 | Search/browse index | **OpenSearch Service** (optional) or Postgres full-text | Start with Postgres |
 | Compose/baremetal files, config/data files, evidence, icons | **Amazon S3** (private, per-org prefix) | Access via short-lived pre-signed URLs only |
 | Container images (hosted-registry path) | **Amazon ECR** (private, per-ISV-org namespace) | External-URL path bypasses ECR — see §8 |
 | Secrets | **AWS Secrets Manager** / KMS-encrypted RDS column | Never plaintext |
 | Async jobs (deployment-file parsing, image scanning, notifications) | **SQS** + **Lambda/Fargate workers** | |
-| Manifest signing | **AWS KMS** (asymmetric signing key) | Device Agent verifies signature using the catalog's published public key |
+| Install token store | **DynamoDB** (or Redis/ElastiCache) with TTL | Single-use, short-lived (minutes) opaque tokens; no asymmetric signing/PKI required — ordinary HTTPS (public CA) secures the Device Agent's redeem call |
 | Audit logs | **CloudTrail** + application `audit_logs` table | |
 | CDN for public listing assets | **CloudFront** over a public S3 prefix | Never for gated artifacts |
 
@@ -443,17 +481,21 @@ recorded license acceptance.
              `license_acceptances(user_id, app_version_id, license_id,
               accepted_at, ip_address)` — immutable, append-only.
       YES → proceed.
-3. Only after this check passes does Catalog Service include, inside the
-   **signed manifest**, a short-lived pre-signed S3 URL (compose/config files)
-   and a temporary ECR pull token scoped only to that app_version's images
-   (hosted-registry path), or the external URL as-is (external path).
-4. Device Agent verifies the manifest signature, then hands the plan to the
-   OEP Installer, which fetches artifacts and runs `docker compose up`.
-5. Re-acceptance is only required again if the license version changes for a
+3. Only after this check passes does Catalog Service issue the **opaque
+   install token** (§4.5) — the token itself grants nothing until redeemed.
+4. Device Agent redeems the token (`GET /install/redeem/{token}`, its own
+   outbound HTTPS call). Catalog Service, at redeem time, includes a
+   short-lived pre-signed S3 URL (compose/config files) and a temporary ECR
+   pull token scoped only to that app_version's images (hosted-registry
+   path), or the external URL as-is (external path).
+5. Device Agent hands the plan to the OEP Installer, which fetches artifacts
+   and runs `docker compose up`.
+6. Re-acceptance is only required again if the license version changes for a
    new app_version.
 ```
-Enforcement is server-side: manifest issuance itself is the gate — nothing is
-downloadable without passing the acceptance check first.
+Enforcement is server-side: **token issuance is the gate** (step 3) and the
+token is only redeemable once (step 4) — nothing is downloadable without
+passing the acceptance check first.
 
 ### 9.3 Image & Artifact Hosting Flow (ISV → ECR/S3, hosted-registry path)
 ```
@@ -486,15 +528,19 @@ distribution options) is the right long-term call.
 ### 11.1 Summary of corrections in this revision
 1. Added the 4th persona (OXM/OEM) and its device-imaging journey.
 2. Replaced the single generic "device agent" with the real Tier-3 split:
-   **Device Agent** (profile, verify, orchestrate) + **OEP Installer**
-   (existing module/profile bootstrap engine — actual install execution).
+   **Device Agent** (profile, redeem install token, orchestrate) + **OEP
+   Installer** (existing module/profile bootstrap engine — actual install
+   execution).
 3. Removed the persistent `devices`/`installations` fleet tables — replaced
-   with session-scoped signed-manifest handoff and anonymous aggregate
+   with session-scoped install-token handoff and anonymous aggregate
    telemetry, per the explicit "no fleet management" design decision.
 4. Added the **HTTPS-loopback-with-cert** channel between Storefront/CLI and
    the local Device Agent (previously only had client→cloud→agent).
-5. Replaced the SQS device job-queue model with **signed-manifest fetch +
-   local signature/compatibility verification** on the Device Agent.
+5. Replaced the SQS device job-queue model with an **opaque single-use
+   install token** relayed by the browser and **redeemed directly by the
+   Device Agent** over its own outbound HTTPS call — no asymmetric
+   signing/PKI needed for this leg (simpler than an earlier signed-manifest
+   design that required KMS + public-key provisioning to every device).
 6. Added Federation (Partner Catalogs, signed indexes) as a Tier-2 concern,
    explicitly future/out-of-scope for TP.
 7. Added MCP as a peer interface to REST on the Catalog Service.
@@ -509,22 +555,25 @@ Tier 3 still depends on the **existing OEP Installer**, which today defines
 install logic as **per-app hardcoded shell functions** with manually pinned git
 tags/commits per component (see the separate OEP Installer review in this
 workstream). Unless the OEP Installer evolves to consume the Catalog Service's
-signed manifest **data-drivenly** (rather than needing a bespoke shell function
+install plan **data-drivenly** (rather than needing a bespoke shell function
 per app baked into the installer itself), this new catalog will inherit that
 duplication-of-install-logic problem at the Tier-3 boundary — worth flagging to
 the OEP Installer owner as this design solidifies.
 
 ### 11.3 Open questions
-1. ~~Device Agent transport~~ — **resolved for v1**: browser-relay-only (§3.1,
-   §4.5); no direct cloud→agent leg or persistent connection needed since the
-   user browses the catalog from the device they're installing onto. Revisit
-   only if a future phase needs remote/fleet-initiated installs.
+1. ~~Device Agent transport~~ — **resolved for v1**: browser triggers the
+   install (relays only an opaque, short-lived token), Device Agent redeems
+   the token and fetches the install plan **directly** from Catalog Service
+   over its own outbound HTTPS call (§3.1, §4.5); no direct cloud→agent leg
+   or persistent connection needed since the user browses the catalog from
+   the device they're installing onto. Revisit only if a future phase needs
+   remote/fleet-initiated installs.
 2. Does "Send back" preserve the same `app_version` row or create a revision history?
 3. Multi-version support: can an SI stay on an older Listed version after a new one is approved?
 4. Geography filter — self-declared by ISV, or derived from org profile?
 5. Image vulnerability scan failure handling: hard block, or admin-overridable warning?
 6. Multi-region: single AWS region sufficient for MVP, or cross-region S3/ECR replication needed?
-7. Bare-metal executable app format: what does "signed manifest" + "compatibility
+7. Bare-metal executable app format: what does the "install plan" + "compatibility
    check" even mean for non-containerized apps — separate design track needed
    before TP claims to support it.
 8. Edge Pack signing/security model, and whether Device Agent + OEP Installer as

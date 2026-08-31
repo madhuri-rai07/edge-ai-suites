@@ -370,31 +370,38 @@ design doc §10; TP2+: OXM-imaged or Edge Pack auto-installs them).
    b. **License gate** (design doc §9.2): checks `license_acceptances` for
       `(user_id, app_version_id)`.
       - Not yet accepted → returns `{ requires_acceptance: true,
-        license_id, license_text_url }` instead of a manifest. Storefront
+        license_id, license_text_url }` instead of a token. Storefront
         shows the EULA, SI clicks "Accept" → `POST /apps/{id}/versions/{v}
         /accept-license` → writes `license_acceptances` row
         (`user_id, org_id, app_version_id, license_id, accepted_at,
         ip_address`) → Storefront re-calls `POST /install` (now passes the
         gate).
-   c. Builds a **signed manifest**: compose file reference + resolved image
-      refs (pre-signed S3 URL / ECR temp pull token for hosted-registry
-      images, or the raw external URL) + `app_version_settings` (secrets
-      still encrypted, decrypted only by the Device Agent) + license terms
-      + compatibility rules, signs it with the KMS asymmetric key (design
-      doc §9.1).
-   d. Returns the signed manifest in the same HTTP response (no async
-      job/polling — synchronous per design doc §3.1 step 4).
-5. Storefront hands the manifest to the Device Agent:
-   `POST https://127.0.0.1:<port>/local/install {manifest}`.
-6. Device Agent: verifies the manifest's signature against the catalog's
-   published public key; independently re-checks `system_profile`
-   compatibility locally (does **not** simply trust the server's pre-check
-   — design doc §8 "Compatibility check" principle); if any
-   `fill_at_install=true` settings remain unfilled, returns a
-   `needs_input: [...]` response to the Storefront, which prompts the SI
-   for those values (e.g. an access token) and re-calls `/local/install`
-   with them merged in.
-7. Device Agent hands the fully-resolved **signed plan** to the **OEP
+   c. Issues an **opaque, short-lived, single-use `install_token`**
+      (stored server-side, e.g. DynamoDB with TTL — design doc §9.1) tied
+      to `app_version_id` + `user_id` + `org_id`. The token carries no
+      payload of its own — it is meaningless without redeeming it.
+   d. Returns `{ install_token, expires_in }` in the same HTTP response (no
+      async job/polling — synchronous per design doc §3.1 step 3).
+5. Storefront hands the token to the Device Agent:
+   `POST https://127.0.0.1:<port>/local/install {install_token}`.
+6. Device Agent **redeems the token itself**, over its own normal
+   **outbound** HTTPS connection (ordinary public-CA TLS, no custom
+   PKI/signing needed): `GET /install/redeem/{install_token}`. Catalog
+   Service validates the token (unexpired, unused, matches an active
+   session), marks it **consumed** (single-use — a second redeem attempt
+   fails), and returns the real install plan: compose file reference +
+   resolved image refs (pre-signed S3 URL / ECR temp pull token for
+   hosted-registry images, or the raw external URL) + `app_version_settings`
+   (secrets still encrypted, decrypted only by the Device Agent) + license
+   terms + compatibility rules. Device Agent independently re-checks
+   `system_profile` compatibility **locally** against this plan (does
+   **not** simply trust the server's step-4a pre-check — design doc §8
+   "Compatibility check" principle); if any `fill_at_install=true` settings
+   remain unfilled, returns a `needs_input: [...]` response to the
+   Storefront, which prompts the SI for those values (e.g. an access token)
+   and re-calls `/local/install` (a fresh token is issued for the retry,
+   since the first was already consumed).
+7. Device Agent hands the fully-resolved **install plan** to the **OEP
    Installer** (existing tool, unmodified per current design — carries
    forward the known per-app-hardcoded-logic risk, design doc §11.2).
    OEP Installer pulls images (from ECR using the temp token, or the
@@ -408,7 +415,7 @@ design doc §10; TP2+: OXM-imaged or Edge Pack auto-installs them).
    yet in the data model — vendor should add
    `app_version_settings`-adjacent `launch_url_template` or similar, flag
    as a gap).
-9. Storefront optionally posts `POST /install/{manifest_id}/telemetry
+9. Storefront optionally posts `POST /install/{install_token}/telemetry
    {action: "install", result: "success"|"failure"}` → writes
    `install_telemetry_events` (aggregate only, no device identity —
    design doc §4.5/§5).
@@ -416,20 +423,20 @@ design doc §10; TP2+: OXM-imaged or Edge Pack auto-installs them).
 **TP1 fallback (no Device Agent/loopback yet):** SI clicks "Install" →
 Catalog Service performs the license gate (step 4b) then returns a
 pre-signed download link + a plain-text install command
-(`oep-cli install --manifest <signed-manifest-url>`) instead of relaying
-through a local HTTPS service. SI runs this manually via a terminal on the
-device (same pattern ESH uses today — download, then user-driven install).
-This still satisfies "download gated by click-to-accept," just without the
+(`oep-cli install --token <install-token>`) instead of relaying through a
+local HTTPS service. SI runs this manually via a terminal on the device
+(same pattern ESH uses today — download, then user-driven install). This
+still satisfies "download gated by click-to-accept," just without the
 in-browser one-click UX; recommend this as the actual TP1 deliverable given
 the loopback/cert decision is still open.
 
-**Error cases:** signature verification failure → Device Agent refuses,
-logs locally, Storefront shows generic "Install failed — please retry"
-(never surface signature details to the end user, but do log
-device-side for support/debug). Incompatible hardware (local check fails
-even though server pre-check passed, e.g. stale system_profile) → Device
-Agent returns `{ error: "incompatible", details }`, Storefront shows
-specific mismatch (e.g. "requires NPU, none detected").
+**Error cases:** token redeem failure (expired/already-consumed/unknown) →
+Device Agent refuses, logs locally, Storefront shows generic "Install
+failed — please retry" (retry re-issues a fresh token from step 4, since
+tokens are single-use). Incompatible hardware (local check fails even
+though server pre-check passed, e.g. stale system_profile) → Device Agent
+returns `{ error: "incompatible", details }`, Storefront shows specific
+mismatch (e.g. "requires NPU, none detected").
 
 ---
 
@@ -441,17 +448,17 @@ specific mismatch (e.g. "requires NPU, none detected").
    "currently installed version" from the Device Agent's local state,
    `GET /local/installed-apps`, then cross-checks against
    `GET /catalog/apps/{id}` for newer listed versions).
-2. Same manifest-issuance flow as D2 steps 3–4 (license re-acceptance only
+2. Same token-issuance flow as D2 steps 3–4 (license re-acceptance only
    triggered if `license_id` changed for the new version, per design doc
    §9.2 "re-acceptance only required if license version changes").
-3. Storefront → Device Agent: `POST /local/upgrade {manifest}` instead of
-   `/local/install`. Device Agent verifies + hands to OEP Installer, which
-   this time runs the equivalent of `docker compose down` (old version) +
-   `docker compose up -d` (new version) — exact OEP Installer command
-   depends on its existing upgrade support (flag: confirm the OEP Installer
-   actually has an idempotent upgrade path today, or if this needs new
-   Installer work — separate from the Catalog project but a dependency of
-   it).
+3. Storefront → Device Agent: `POST /local/upgrade {install_token}`
+   instead of `/local/install`. Device Agent redeems the token, then hands
+   the resolved plan to OEP Installer, which this time runs the equivalent
+   of `docker compose down` (old version) + `docker compose up -d` (new
+   version) — exact OEP Installer command depends on its existing upgrade
+   support (flag: confirm the OEP Installer actually has an idempotent
+   upgrade path today, or if this needs new Installer work — separate from
+   the Catalog project but a dependency of it).
 4. Status/telemetry same pattern as D2 steps 8–9, `action: "upgrade"`.
 
 **TP1 fallback:** same manual CLI pattern as D2, `oep-cli upgrade`.
@@ -463,8 +470,8 @@ specific mismatch (e.g. "requires NPU, none detected").
 1. SI opens an installed app (D5) → "Uninstall" → confirmation dialog.
 2. Storefront → Device Agent: `POST /local/uninstall {app_version_id}` —
    **note this call does not need to reach Catalog Service at all**; it's
-   a purely local action (no manifest needed to remove something already
-   present, design doc §7 lists this as local-only).
+   a purely local action (no install token needed to remove something
+   already present, design doc §7 lists this as local-only).
 3. Device Agent hands to OEP Installer to stop + remove containers/volumes
    per that app's `_remove` module function (existing OEP Installer
    convention).
