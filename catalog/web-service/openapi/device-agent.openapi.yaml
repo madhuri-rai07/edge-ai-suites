@@ -1,0 +1,268 @@
+openapi: 3.0.3
+info:
+  title: Edge AI Catalog — Device Agent Local API
+  version: "0.1.0"
+  description: >
+    Tier 3 local-only API served by the Device Agent on each edge device.
+    The Storefront SPA (running in the browser, on the same device) talks
+    to this API over an HTTPS loopback binding — see
+    `edge-ai-catalog-design.md` §3.1.1 for the full cert/PNA mechanism,
+    which is DEFERRED / not yet finalized. This spec documents the
+    intended request/response contract only; it does NOT resolve the
+    loopback trust/cert-provisioning decision. Every operation here has a
+    documented TP1 manual-CLI fallback in `technical-flows.md` (flows
+    D2-D5) for use before the Device Agent ships.
+servers:
+  - url: "https://127.0.0.1:{port}/local/v1"
+    description: Loopback-only; port and cert are provisioned per design §3.1.1
+    variables:
+      port:
+        default: "17463"
+
+security:
+  - originHeader: []
+
+tags:
+  - name: profile
+  - name: lifecycle
+
+paths:
+  /system-profile:
+    get:
+      tags: [profile]
+      summary: Report local hardware/OS profile for compatibility checks (flow D2 step 2)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SystemProfile" }
+        "403":
+          description: Origin header did not match the expected Storefront origin (defense-in-depth check, design §3.1.1)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /install:
+    post:
+      tags: [lifecycle]
+      summary: >
+        Accept a signed install manifest, verify its signature and
+        expiry, pull images, and start the app (flow D2 steps 5-8).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignedManifest" }
+      responses:
+        "202":
+          description: Accepted — install running asynchronously
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallJob" }
+        "400":
+          description: Malformed manifest
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Manifest signature invalid or expired (flow D2 step 6 error case)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >
+            Local compatibility re-check failed (hardware_requirements not
+            met, or app already installed) — Device Agent re-validates
+            independently of the server-side advisory check (flow D2 step 6)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /upgrade:
+    post:
+      tags: [lifecycle]
+      summary: Upgrade an installed app to a new signed manifest/version (flow D3 steps 2-3)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignedManifest" }
+      responses:
+        "202":
+          description: Accepted — upgrade running asynchronously
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallJob" }
+        "404":
+          description: App is not currently installed (nothing to upgrade)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Manifest signature invalid or expired
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Local compatibility re-check failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /uninstall:
+    post:
+      tags: [lifecycle]
+      summary: Stop and remove an installed app and its resources (flow D4 steps 2-4)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id]
+              properties:
+                app_id: { type: string, format: uuid }
+                purge_volumes:
+                  type: boolean
+                  default: false
+                  description: Also remove persistent app data volumes
+      responses:
+        "202":
+          description: Accepted — uninstall running asynchronously
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallJob" }
+        "404":
+          description: App is not currently installed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /installed-apps:
+    get:
+      tags: [lifecycle]
+      summary: List apps currently installed on this device (flow D5 step 1)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/InstalledApp" }
+
+  /install/{jobId}/status:
+    get:
+      tags: [lifecycle]
+      summary: Poll async install/upgrade/uninstall job status (flows D2 step 7, D3 step 3, D4 step 3)
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallJob" }
+        "404":
+          description: Unknown job id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    originHeader:
+      type: apiKey
+      in: header
+      name: Origin
+      description: >
+        Device Agent validates the browser-supplied Origin header matches
+        the known Storefront origin as defense-in-depth, in addition to
+        TLS/cert trust and (where applicable) Private Network Access
+        preflight — see design §3.1.1. This is NOT a substitute for the
+        underlying loopback cert mechanism, which is still under decision.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    SystemProfile:
+      type: object
+      properties:
+        os: { type: string, example: "Ubuntu 22.04" }
+        edge_pack_version: { type: string }
+        cpu: { type: string }
+        gpu: { type: string, nullable: true }
+        npu: { type: boolean }
+        memory_gb: { type: integer }
+        device_agent_version: { type: string }
+
+    SignedManifest:
+      type: object
+      description: Identical shape to the SignedManifest returned by the Catalog Service's POST /install (see catalog-service.openapi.yaml)
+      properties:
+        manifest_id: { type: string, format: uuid }
+        app_version_id: { type: string, format: uuid }
+        compose_url: { type: string, format: uri }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              service_name: { type: string }
+              image_ref: { type: string }
+              pull_token: { type: string, nullable: true }
+        settings:
+          type: array
+          items:
+            type: object
+            properties:
+              env_key: { type: string }
+              value: { type: string }
+        license_terms_url: { type: string, format: uri }
+        compatibility_rules:
+          type: object
+          additionalProperties: true
+        signature: { type: string }
+        issued_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    InstallJob:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        action: { type: string, enum: [install, upgrade, uninstall] }
+        state:
+          type: string
+          enum: [queued, pulling_images, starting, running, completed, failed, rolled_back]
+        progress_pct: { type: integer, minimum: 0, maximum: 100 }
+        error_message: { type: string, nullable: true }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    InstalledApp:
+      type: object
+      properties:
+        app_id: { type: string, format: uuid }
+        app_version_id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: string }
+        icon_url: { type: string, format: uri }
+        installed_at: { type: string, format: date-time }
+        state: { type: string, enum: [running, stopped, error] }
+        launch_url:
+          type: string
+          format: uri
+          nullable: true
+          description: >
+            NOTE — no equivalent field exists in the source MVP docs today;
+            recommended addition so the SI has a way to "launch" the app
+            post-install (see technical-flows.md open items).

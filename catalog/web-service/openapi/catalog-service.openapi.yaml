@@ -1,0 +1,984 @@
+openapi: 3.0.3
+info:
+  title: Edge AI Catalog — Catalog Service API
+  version: "0.1.0"
+  description: >
+    Tier 2 cloud API consumed by the Storefront SPA and the `eaictl` CLI.
+    Covers auth, ISV onboarding, Intel Admin review/governance, and SI
+    discovery/install-manifest issuance. See `edge-ai-catalog-design.md`
+    (§4, §5, §7) and `technical-flows.md` for the narrative behind every
+    endpoint below — this spec is the machine-checkable contract derived
+    from those documents; flow doc section refs are noted per operation.
+servers:
+  - url: https://catalog.intel.com/api/v1
+    description: Production
+  - url: https://catalog-qa.intel.com/api/v1
+    description: QA / Tech Preview
+
+security:
+  - sessionCookie: []
+
+tags:
+  - name: auth
+  - name: isv
+  - name: admin
+  - name: catalog
+
+paths:
+  # ---------------------------------------------------------------- auth --
+  /auth/login:
+    get:
+      tags: [auth]
+      summary: Begin SSO login (flow A1 step 1-2)
+      security: []
+      responses:
+        "302":
+          description: Redirect to Intel SSO / Cognito authorization endpoint
+
+  /auth/callback:
+    get:
+      tags: [auth]
+      summary: SSO callback; allowlist check + session creation (flow A1 steps 3-6)
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect to Storefront home with a session cookie set
+        "403":
+          description: Email not on the allowlist / invitation expired (generic message, flow A1 step 5)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /me:
+    get:
+      tags: [auth]
+      summary: Current user profile, roles, orgs (flow A1 step 7)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserProfile" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ------------------------------------------------------------------ isv --
+  /apps:
+    post:
+      tags: [isv]
+      summary: Create a new app listing draft (flow B1 step 2)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppCreateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /apps/{appId}:
+    put:
+      tags: [isv]
+      summary: Update app-level metadata (name, category, description, tags, icon, license)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppUpdateRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [isv]
+      summary: Delist a listed app (flow B3 step 3)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "204": { description: Delisted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: App is not in a delistable state (must be `listed`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /apps/{appId}/assets/icon-upload-url:
+    post:
+      tags: [isv]
+      summary: Get a pre-signed S3 PUT URL for the app icon (flow B1 step 2)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PresignedUpload" }
+
+  /apps/{appId}/versions:
+    post:
+      tags: [isv]
+      summary: Create a new app_version, optionally cloned from a prior version (flows B1 step 3, B2 step 2)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppVersionCreateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersion" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /apps/{appId}/versions/{versionId}/parse-deployment:
+    post:
+      tags: [isv]
+      summary: Parse the uploaded compose file; extract images/settings/volumes (flow B1 step 4)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+      responses:
+        "200":
+          description: Parsed successfully
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ParsedDeployment" }
+        "422":
+          description: Compose file failed to parse (invalid syntax/schema)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /apps/{appId}/versions/{versionId}/images/{imageId}:
+    put:
+      tags: [isv]
+      summary: Set image source (hosted registry push vs external URL) (flow B1 step 5)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+        - name: imageId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppVersionImageUpdateRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersionImage" }
+
+  /apps/{appId}/versions/{versionId}/images/{imageId}/push-credentials:
+    post:
+      tags: [isv]
+      summary: Short-lived ECR push credentials for the hosted-registry path (flow B1 step 5)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+        - name: imageId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EcrPushCredentials" }
+
+  /apps/{appId}/versions/{versionId}/settings:
+    put:
+      tags: [isv]
+      summary: Bulk upsert env-var settings for this version (flow B1 step 6)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/AppVersionSettingUpsert" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AppVersionSetting" }
+
+  /apps/{appId}/versions/{versionId}/evidence:
+    post:
+      tags: [isv]
+      summary: Record the tested-on hardware evidence URL (flow B1 step 7)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [test_evidence_url]
+              properties:
+                test_evidence_url: { type: string, format: uri }
+      responses:
+        "200": { description: OK }
+
+  /apps/{appId}/versions/{versionId}/submit:
+    post:
+      tags: [isv]
+      summary: Submit for Intel review; validates completeness + scan status (flow B1 step 8, B2 step 4)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+      responses:
+        "200":
+          description: Submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [pending_review] }
+        "400":
+          description: Validation failed — missing/invalid fields (flow B1 step 8 error case)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationError" }
+        "409":
+          description: One or more hosted-registry images have not completed vulnerability scanning
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /apps/{appId}/versions/{versionId}/accept-license:
+    post:
+      tags: [isv, catalog]
+      summary: Record a license/EULA click-to-accept event (flow D2 step 4b; also usable by ISV for self-test installs)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+        - $ref: "#/components/parameters/VersionId"
+      responses:
+        "201":
+          description: Acceptance recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LicenseAcceptance" }
+
+  /licenses:
+    post:
+      tags: [isv]
+      summary: Register a new license/EULA text (flow B1 step 2)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LicenseCreateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/License" }
+
+  /isv/dashboard:
+    get:
+      tags: [isv]
+      summary: ISV dashboard — apps, versions, statuses, aggregate counts (flow B3 step 1)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IsvDashboard" }
+
+  # ---------------------------------------------------------------- admin --
+  /admin/reviews:
+    get:
+      tags: [admin]
+      summary: List app_versions pending review, filterable (flow C1 step 1)
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/AppVersionStatus" }
+        - name: isv
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AppVersion" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/reviews/{versionId}/approve:
+    post:
+      tags: [admin]
+      summary: Approve a pending app_version → listed (flow C1 step 3)
+      parameters:
+        - $ref: "#/components/parameters/VersionId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersion" }
+
+  /admin/reviews/{versionId}/send-back:
+    post:
+      tags: [admin]
+      summary: Send back a pending app_version with comments (flow C1 step 3)
+      parameters:
+        - $ref: "#/components/parameters/VersionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [comments]
+              properties:
+                comments: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersion" }
+
+  /admin/reviews/{versionId}/reject:
+    post:
+      tags: [admin]
+      summary: Reject a pending app_version (terminal) (flow C1 step 3)
+      parameters:
+        - $ref: "#/components/parameters/VersionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [comments]
+              properties:
+                comments: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersion" }
+
+  /admin/apps/{appId}/suspend:
+    post:
+      tags: [admin]
+      summary: Suspend a listed app; hides from catalog, existing installs unaffected (flow C2 step 2)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+
+  /admin/apps/{appId}/resume:
+    post:
+      tags: [admin]
+      summary: Resume a suspended app (flow C2 step 3)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/App" }
+
+  /admin/apps/{appId}:
+    delete:
+      tags: [admin]
+      summary: Remove an app (terminal) (flow C2 step 4)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "204": { description: Removed }
+
+  /admin/invitations:
+    post:
+      tags: [admin]
+      summary: Invite a partner user (flow C3 step 1)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InvitationCreateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invitation" }
+
+  /admin/users/{userId}/roles:
+    put:
+      tags: [admin]
+      summary: Replace a user's role assignments (flow C3 step 2)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserProfile" }
+
+  /admin/users/{userId}:
+    delete:
+      tags: [admin]
+      summary: >
+        Revoke a user's access (soft-delete all roles, invalidate sessions).
+        NOTE — not explicitly named in source MVP doc; recommended addition,
+        see technical-flows.md flow C3 step 3.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Revoked }
+
+  # -------------------------------------------------------------- catalog --
+  /catalog:
+    get:
+      tags: [catalog]
+      summary: Browse/search listed apps (flow D1 steps 1-2)
+      parameters:
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: search
+          in: query
+          schema: { type: string }
+        - name: isv
+          in: query
+          schema: { type: string }
+        - name: geo
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+      responses:
+        "200":
+          description: OK — server enforces status=listed regardless of filters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/AppSummary" }
+                  total: { type: integer }
+                  page: { type: integer }
+
+  /catalog/apps/{appId}:
+    get:
+      tags: [catalog]
+      summary: App detail page (flow D1 step 3)
+      parameters:
+        - $ref: "#/components/parameters/AppId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /install:
+    post:
+      tags: [catalog]
+      summary: >
+        Issue a signed install manifest for one app_version + system profile,
+        gated by license acceptance (flow D2 steps 3-4, D3 step 2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InstallRequest" }
+      responses:
+        "200":
+          description: Signed manifest issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignedManifest" }
+        "428":
+          description: License not yet accepted — client must call accept-license then retry
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LicenseAcceptanceRequired" }
+        "409":
+          description: Server-side compatibility pre-check failed (advisory; Device Agent re-checks locally)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /install/{manifestId}/telemetry:
+    post:
+      tags: [catalog]
+      summary: Optional aggregate install/upgrade/uninstall telemetry ping (flow D2 step 9, D3 step 4, D4 step 5)
+      parameters:
+        - name: manifestId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, result]
+              properties:
+                action: { type: string, enum: [install, upgrade, uninstall] }
+                result: { type: string, enum: [success, failure] }
+      responses:
+        "202": { description: Accepted (fire-and-forget, no device identity retained) }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: catalog_session
+      description: Server-side session established after SSO callback (flow A1)
+
+  parameters:
+    AppId:
+      name: appId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    VersionId:
+      name: versionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: No/invalid session
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but lacks the required role/ownership
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+
+    ValidationError:
+      type: object
+      properties:
+        code: { type: string, example: validation_failed }
+        message: { type: string }
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              reason: { type: string }
+
+    Role:
+      type: string
+      enum: [OXM, ISV, SI, ADMIN]
+
+    UserProfile:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/Role" }
+        orgs:
+          type: array
+          items:
+            type: object
+            properties:
+              org_id: { type: string, format: uuid }
+              name: { type: string }
+              org_type: { type: string, enum: [OXM, ISV, SI, INTEL] }
+
+    InvitationCreateRequest:
+      type: object
+      required: [email, role, org_id]
+      properties:
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/Role" }
+        org_id: { type: string, format: uuid }
+
+    Invitation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/Role" }
+        org_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, accepted, expired] }
+        expires_at: { type: string, format: date-time }
+
+    AppCategory:
+      type: string
+      enum: [Retail, Industrial, Robotics, "Cities & Infrastructure", Education, Other]
+
+    AppStatus:
+      type: string
+      enum: [draft, pending_review, listed, sent_back, rejected, suspended, removed]
+
+    AppVersionStatus:
+      type: string
+      enum: [draft, pending_review, listed, sent_back, rejected]
+
+    AppCreateRequest:
+      type: object
+      required: [name, category, org_id]
+      properties:
+        name: { type: string }
+        category: { $ref: "#/components/schemas/AppCategory" }
+        description: { type: string }
+        tags: { type: array, items: { type: string } }
+        org_id: { type: string, format: uuid }
+
+    AppUpdateRequest:
+      type: object
+      properties:
+        name: { type: string }
+        category: { $ref: "#/components/schemas/AppCategory" }
+        description: { type: string }
+        tags: { type: array, items: { type: string } }
+        icon_url: { type: string, format: uri }
+        license_id: { type: string, format: uuid }
+
+    App:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        isv_org_id: { type: string, format: uuid }
+        name: { type: string }
+        category: { $ref: "#/components/schemas/AppCategory" }
+        description: { type: string }
+        tags: { type: array, items: { type: string } }
+        icon_url: { type: string, format: uri }
+        license_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/AppStatus" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AppSummary:
+      type: object
+      description: Lightweight shape for catalog browse/search results
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        category: { $ref: "#/components/schemas/AppCategory" }
+        icon_url: { type: string, format: uri }
+        isv_org_name: { type: string }
+        short_description: { type: string }
+
+    AppDetail:
+      allOf:
+        - $ref: "#/components/schemas/App"
+        - type: object
+          properties:
+            versions:
+              type: array
+              items: { $ref: "#/components/schemas/AppVersion" }
+            isv_org_name: { type: string }
+
+    PresignedUpload:
+      type: object
+      properties:
+        upload_url: { type: string, format: uri }
+        method: { type: string, enum: [PUT] }
+        expires_at: { type: string, format: date-time }
+        final_url: { type: string, format: uri }
+
+    AppVersionCreateRequest:
+      type: object
+      properties:
+        deployment_file_url: { type: string, format: uri }
+        deployment_kind: { type: string, enum: [compose, baremetal], default: compose }
+        version: { type: string, example: "1.0.0" }
+        base_version_id:
+          type: string
+          format: uuid
+          description: If set, clone images/settings/hardware_requirements from this prior version (flow B2 step 2)
+
+    AppVersion:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        version: { type: string }
+        deployment_file_url: { type: string, format: uri }
+        deployment_kind: { type: string, enum: [compose, baremetal] }
+        status: { $ref: "#/components/schemas/AppVersionStatus" }
+        hardware_requirements:
+          type: object
+          additionalProperties: true
+          example: { cpu: "x86_64", gpu: "Intel Arc A770 or better", npu: false, memory_gb: 16 }
+        test_evidence_url: { type: string, format: uri }
+        submitted_at: { type: string, format: date-time }
+        reviewed_at: { type: string, format: date-time }
+        reviewer_id: { type: string, format: uuid }
+        review_comments: { type: string }
+
+    ParsedDeployment:
+      type: object
+      properties:
+        images:
+          type: array
+          items: { $ref: "#/components/schemas/AppVersionImage" }
+        settings:
+          type: array
+          items: { $ref: "#/components/schemas/AppVersionSetting" }
+        referenced_files:
+          type: array
+          items:
+            type: object
+            properties:
+              path_in_compose: { type: string }
+              upload_url: { type: string, format: uri }
+
+    AppVersionImage:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        app_version_id: { type: string, format: uuid }
+        service_name: { type: string }
+        image_ref: { type: string }
+        source: { type: string, enum: [hosted_registry, external_url] }
+        registry_or_url: { type: string }
+        requires_pull_secret: { type: boolean }
+        scan_status:
+          type: string
+          enum: [not_applicable, pending, passed, failed]
+          description: not_applicable for external_url images (flow B1 step 5 / §9.3)
+
+    AppVersionImageUpdateRequest:
+      type: object
+      properties:
+        source: { type: string, enum: [hosted_registry, external_url] }
+        registry_or_url: { type: string }
+
+    EcrPushCredentials:
+      type: object
+      properties:
+        registry_uri: { type: string }
+        repository: { type: string }
+        auth_token: { type: string, description: "short-lived, base64 ECR auth token" }
+        expires_at: { type: string, format: date-time }
+
+    AppVersionSettingUpsert:
+      type: object
+      required: [env_key]
+      properties:
+        env_key: { type: string }
+        default_value: { type: string }
+        is_secret: { type: boolean, default: false }
+        fill_at_install: { type: boolean, default: false }
+        description: { type: string }
+
+    AppVersionSetting:
+      allOf:
+        - $ref: "#/components/schemas/AppVersionSettingUpsert"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            app_version_id: { type: string, format: uuid }
+
+    LicenseCreateRequest:
+      type: object
+      required: [title, text_url, version]
+      properties:
+        title: { type: string }
+        text_url: { type: string, format: uri }
+        version: { type: string }
+
+    License:
+      allOf:
+        - $ref: "#/components/schemas/LicenseCreateRequest"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+
+    LicenseAcceptance:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        org_id: { type: string, format: uuid }
+        app_version_id: { type: string, format: uuid }
+        license_id: { type: string, format: uuid }
+        accepted_at: { type: string, format: date-time }
+        ip_address: { type: string }
+
+    LicenseAcceptanceRequired:
+      type: object
+      properties:
+        requires_acceptance: { type: boolean, example: true }
+        license_id: { type: string, format: uuid }
+        license_text_url: { type: string, format: uri }
+
+    IsvDashboard:
+      type: object
+      properties:
+        apps:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/App"
+              - type: object
+                properties:
+                  versions:
+                    type: array
+                    items: { $ref: "#/components/schemas/AppVersion" }
+        counts:
+          type: object
+          properties:
+            listed: { type: integer }
+            pending_review: { type: integer }
+            downloads: { type: integer }
+            installs: { type: integer }
+
+    SystemProfile:
+      type: object
+      description: Reported by the local Device Agent (flow D2 step 2)
+      properties:
+        os: { type: string, example: "Ubuntu 22.04" }
+        edge_pack_version: { type: string }
+        cpu: { type: string }
+        gpu: { type: string, nullable: true }
+        npu: { type: boolean }
+        memory_gb: { type: integer }
+
+    InstallRequest:
+      type: object
+      required: [app_version_id, system_profile]
+      properties:
+        app_version_id: { type: string, format: uuid }
+        system_profile: { $ref: "#/components/schemas/SystemProfile" }
+        settings_overrides:
+          type: array
+          description: Values for fill_at_install settings, if already known
+          items:
+            type: object
+            properties:
+              env_key: { type: string }
+              value: { type: string }
+
+    SignedManifest:
+      type: object
+      description: >
+        Returned synchronously by POST /install; relayed by the Storefront/CLI
+        to the local Device Agent over loopback (flow D2 step 5).
+      properties:
+        manifest_id: { type: string, format: uuid }
+        app_version_id: { type: string, format: uuid }
+        compose_url: { type: string, format: uri, description: "pre-signed S3 URL" }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              service_name: { type: string }
+              image_ref: { type: string }
+              pull_token: { type: string, nullable: true, description: "ECR temp token, hosted-registry path only" }
+        settings:
+          type: array
+          items:
+            type: object
+            properties:
+              env_key: { type: string }
+              value: { type: string, description: "encrypted at rest; Device Agent decrypts" }
+        license_terms_url: { type: string, format: uri }
+        compatibility_rules:
+          type: object
+          additionalProperties: true
+        signature: { type: string, description: "base64, signed with catalog's KMS asymmetric key" }
+        issued_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }

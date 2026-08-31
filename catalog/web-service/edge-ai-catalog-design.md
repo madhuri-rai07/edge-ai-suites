@@ -19,6 +19,15 @@ by a recorded click-to-accept (license) event**; SSO login; backend manages app
 metadata, artifacts, and container images on **AWS** (Tier 2 implementation
 choice — see §9).
 
+**v1 scope decision — [CONFIRMED]:** No fleet management in this first version.
+The Storefront is a single website **hosted at an Intel domain**; the SI opens
+it **from a browser running on the edge device itself** (not a remote fleet
+console). All install actions are scoped to *that one device, in that one
+browser session* — the Storefront talks to Catalog Service over normal HTTPS,
+and separately talks to the **local Device Agent via loopback** to trigger the
+actual install on click. There is no cloud-to-device leg, no device inventory,
+and no cross-device dashboard in v1 — see §3.2 and §4.5 (updated).
+
 ## 2. Personas
 
 | Persona | Goal | Key capabilities |
@@ -33,6 +42,124 @@ is an Intel-only role.
 
 ## 3. High-Level Architecture — 3 Tiers *(replaces prior architecture — [CORRECTED])*
 
+### 3.1 v1 flow — no fleet management, single-device browser session *(new — [CONFIRMED])*
+
+```
+                      Edge Device (SI's browser + local runtime)
+   ┌──────────────────────────────────────────────────────────────────┐
+   │  Browser: Storefront SPA (loaded from catalog.intel.com)          │
+   │       │                                    │                     │
+   │       │ HTTPS (normal internet)             │ HTTPS loopback (cert)│
+   │       ▼                                    ▼                     │
+   │  ┌───────────────────┐              ┌───────────────────────┐    │
+   │  │ Catalog Service     │◄────────────┤ Device Agent (local)    │    │
+   │  │ (cloud, Tier 2)     │  fetches     │  - answers SystemProfile│   │
+   │  │ - listings, review  │  signed      │    query from browser   │   │
+   │  │ - issues signed      │  manifest    │  - verifies signed      │   │
+   │  │   manifest on        │─────────────►│    manifest (relayed by │   │
+   │  │   /install request   │  (browser    │    the browser)          │   │
+   │  └───────────────────┘   relays it)   │  - hands signed plan to │    │
+   │                                       │    OEP Installer         │   │
+   │                                       └──────────┬──────────────┘    │
+   │                                                  │ signed plan       │
+   │                                       ┌──────────▼──────────────┐    │
+   │                                       │  OEP Installer            │    │
+   │                                       │  (existing bootstrap tool)│   │
+   │                                       └──────────┬──────────────┘    │
+   │                                                  │ docker compose up │
+   │                                       ┌──────────▼──────────────┐    │
+   │                                       │     App Containers        │    │
+   │                                       └───────────────────────┘    │
+   └──────────────────────────────────────────────────────────────────┘
+```
+
+For v1, **the browser is the only bridge between cloud and device** — Catalog
+Service never needs inbound reachability to the device. Sequence:
+1. Browser (Storefront) loads from the Intel-hosted domain.
+2. Browser asks the local Device Agent (loopback) for a SystemProfile.
+3. Browser calls Catalog Service `POST /install {app_version_id, system_profile}`.
+4. Catalog Service returns a **signed manifest** to the browser (same HTTPS
+   response — no separate cloud→device leg needed).
+5. Browser hands the manifest to the Device Agent over the same loopback
+   connection; Device Agent verifies the signature + compatibility locally.
+6. Device Agent hands a signed plan to the OEP Installer, which pulls
+   artifacts and runs `docker compose up`.
+7. Device Agent reports status back to the browser (loopback); browser shows
+   "App available" and optionally posts an aggregate install-telemetry event
+   to Catalog Service — no per-device record is created or retained.
+
+This resolves the open transport question from the prior revision (§11.3 #1
+below) for v1: **no WebSocket/long-poll/direct cloud→agent connection is
+needed** — the browser relay is sufficient because the user is physically
+using the device they're installing onto.
+
+### 3.1.1 How "HTTPS loopback with a cert" technically works *(new — detail)*
+
+This pattern (browser page ↔ local daemon) is used by tools like Docker
+Desktop, Plex, and Spotify Connect. It requires solving three distinct browser
+security constraints, not just "call localhost":
+
+**a) Device Agent binds only to loopback.** It runs an HTTPS server on
+`https://127.0.0.1:<fixed-port>` (e.g. `47100`), bound to the loopback
+interface only — never `0.0.0.0`. No firewall rule or NAT traversal is
+involved; nothing external can reach this port. This is precisely what makes
+"no cloud-to-device inbound connection required" true: the cloud never talks
+to the device — only the browser, already running *on* that same device,
+talks to a socket on that machine.
+
+**b) It must be HTTPS, not HTTP, and the cert must be browser-trusted.** The
+Storefront page is served over HTTPS from `catalog.intel.com`; browsers block
+**mixed content**, so an HTTPS page cannot call a plain `http://` endpoint —
+Device Agent must terminate real TLS locally. A naive self-signed cert for
+`127.0.0.1` triggers browser warnings and `fetch()` rejection, so one of two
+provisioning strategies is needed (decided once, during device setup — not
+something the browser session can bootstrap itself):
+- **Wildcard-DNS-to-loopback + real public CA cert** (the approach Plex uses
+  with `*.plex.direct`): register something like
+  `*.local.catalog.intel.com` in public DNS resolving to `127.0.0.1`, and
+  issue Device Agent a real CA-signed cert for that hostname during
+  provisioning. The browser sees a normal, publicly trusted cert with no
+  warnings, even though the connection never leaves the loopback interface.
+- **Pre-installed local root CA** (Docker Desktop's approach): install a
+  private root CA into the OS/browser trust store during OXM imaging or OEP
+  Installer setup; Device Agent presents a cert signed by that CA for
+  `localhost`. Ties naturally into the existing Edge Pack/Device Agent
+  provisioning step (§10).
+
+**c) Browser CORS + Private Network Access (PNA) policy.** Even with a
+trusted cert, Chrome/Edge treat a request from a public page to a private
+address (`127.0.0.1`) as a **Private Network Access** request: the browser
+sends a preflight with `Access-Control-Request-Private-Network: true`, and
+Device Agent must answer with `Access-Control-Allow-Private-Network: true`
+plus CORS headers naming the exact calling origin (`https://catalog.intel.com`).
+Depending on browser version this may also trigger a user-facing permission
+prompt — PNA is an evolving spec and must be explicitly tested against the
+two browsers named in the source deck (Chrome, Edge).
+
+**d) Defense-in-depth on the Device Agent side.** Since the loopback port is
+technically reachable by any local process/tab on that machine, Device Agent
+should still (i) validate the `Origin` header strictly equals the known
+catalog domain, and (ii) only act on manifests carrying the Catalog Service's
+**signature** (§4.5) — so even a malicious local page hitting the port cannot
+forge a valid install request.
+
+**Illustrative sequence:**
+```
+Browser (https://catalog.intel.com)
+   │ fetch("https://127.0.0.1:47100/local/system-profile", {mode:"cors"})
+   │  — TLS trusted (via DNS-trick cert or pre-installed root CA)
+   │  — PNA preflight satisfied by Device Agent's CORS headers
+   ▼
+Device Agent (127.0.0.1:47100, loopback-only)
+   │ validates Origin header, responds with SystemProfile
+   ▼
+Browser → POST /install to Catalog Service (normal internet) → signed manifest
+Browser → POST manifest to Device Agent over the same loopback HTTPS connection
+Device Agent verifies manifest signature → hands plan to OEP Installer
+```
+
+### 3.2 Full 3-tier component view (target state, includes future Federation)
+
 ```
  Tier 1 — Catalog UI/UX              Tier 2 — Catalog Cloud Service           Tier 3 — Edge Runtime
 ┌───────────────────────┐          ┌─────────────────────────────────┐     ┌───────────────────────────┐
@@ -41,9 +168,9 @@ is an Intel-only role.
 │                       │  Catalog │  Registry | Hosted Artifacts     │     │   - verifies signed       │
 │  CLI (`eaictl`)       │  API     │                                   │     │     manifest              │
 └──────────┬────────────┘          └───────────────┬─────────────────┘     │   - hands signed plan to  │
-           │  loopback HTTPS (cert)                 │ install job +         │     OEP Installer         │
-           │  SystemProfile, install trigger         │ signed manifest       │   - manages app lifecycle │
-           └─────────────────────────────────────────┼──────────────────────►│                           │
+           │  loopback HTTPS (cert)                 │ (future: direct       │     OEP Installer         │
+           │  SystemProfile, install trigger         │  cloud→agent leg,     │   - manages app lifecycle │
+           └─────────────────────────────────────────┼  not needed for v1) ─►│                           │
                                                        │                      └──────────┬────────────────┘
                                           Federation   │                                 │ signed plan
                                        (signed indexes,│                      ┌──────────▼────────────────┐
@@ -77,7 +204,7 @@ docker compose"; the real design keeps them as two distinct, collaborating
 components, and Tier 3 still depends on the existing OEP Installer's
 capabilities/limitations (see §11.2).
 
-### 3.1 Key design decisions (carried over verbatim from source deck)
+### 3.3 Key design decisions (carried over verbatim from source deck)
 - Base system = Edge Pack + OEP Installer + Device Agent + config. First choice:
   OXM images this. Fallback: SI runs install scripts on top of Ubuntu.
 - One-click install uses **HTTPS loopback with a cert** to talk to the local
@@ -128,34 +255,40 @@ capabilities/limitations (see §11.2).
 - Suspend/Resume/Remove available any time on Listed apps (reasons out of scope
   of this document, owned by catalog governance).
 
-### 4.5 Install Orchestration (session-based, not fleet-based) *(rewritten — [CORRECTED])*
-No persistent device registry. Instead, a **session-scoped, signed-manifest**
-handoff per install action:
-1. Storefront/CLI queries the local **Device Agent via loopback** for a fresh
+### 4.5 Install Orchestration (v1: browser-relayed, single-device, no fleet) *(rewritten — [CONFIRMED])*
+No persistent device registry, and — for v1 — **no direct cloud→device leg at
+all**. The Storefront browser, running on the same edge device the SI is
+installing onto, is the sole relay between Catalog Service and the local
+Device Agent (see §3.1 for the full sequence):
+1. Storefront queries the local **Device Agent via loopback** for a fresh
    **SystemProfile** (hardware, OS, Edge Pack version).
-2. Storefront/CLI calls Catalog Service: `POST /install {app-id, system-profile}`.
+2. Storefront calls Catalog Service: `POST /install {app_version_id, system_profile}`.
 3. Catalog Service builds a **signed manifest** (app compose + image refs +
-   settings + license terms + compatibility rules) and returns/streams it to the
-   Device Agent (directly, or relayed by the Storefront/CLI over the same
-   loopback channel used for profiling).
-4. Device Agent **verifies the manifest's signature** and checks the
-   SystemProfile against the manifest's compatibility rules **locally**.
+   settings + license terms + compatibility rules) and returns it **in the same
+   HTTPS response** to the Storefront — no separate agent-facing channel needed.
+4. Storefront hands the manifest to the Device Agent over the loopback
+   connection. Device Agent **verifies the manifest's signature** and checks
+   the SystemProfile against the manifest's compatibility rules **locally**.
 5. Device Agent provisions prerequisites (drivers, container runtime, udev
    rules) if needed, then hands a **signed plan** to the **OEP Installer**.
 6. OEP Installer pulls images from the registry (or the ISV-provided URL),
    renders/injects settings, and runs `docker compose up` with declared device
    passthrough.
-7. Status flows back: OEP Installer → Device Agent → Catalog Service →
-   Storefront/CLI → user ("App available").
-- **Upgrade**: same flow targeting a new `app_version`'s manifest.
-- **Uninstall**: Device Agent instructs OEP Installer to stop/remove; no
-  central "installations" row to clean up since none is persisted centrally.
-- **View installed apps / health**: served **locally** by the Device Agent/CLI
-  on that device (via loopback), not a central cross-device fleet dashboard.
+7. Status flows back: OEP Installer → Device Agent → Storefront (loopback) →
+   user ("App available"); Storefront optionally posts an aggregate
+   install-telemetry event to Catalog Service.
+- **Upgrade/Uninstall**: same browser-relayed flow; Device Agent instructs OEP
+  Installer to stop/remove; no central "installations" row to clean up.
+- **View installed apps / health**: served **locally** by the Device Agent
+  (via loopback) to whichever browser/CLI is currently open on that device —
+  not a central cross-device fleet dashboard.
 - Aggregate counters shown on ISV/Admin dashboards ("downloads", "installs")
   are recorded as **anonymous/aggregate telemetry events** keyed by
   `app_version_id` + requesting org only — not tied to a persistent device
-  identity, preserving the "no fleet management" decision.
+  identity, preserving the v1 "no fleet management" decision.
+- **CLI (`eaictl`) note**: the CLI plays the same relay role as the browser
+  when used instead of/alongside the Storefront — it also runs on the device
+  and talks to the local Device Agent over loopback.
 
 ### 4.6 Notification Service
 - Email/webhook on: submission received, sent-back, approved, rejected,
@@ -252,21 +385,19 @@ installable until the new one is approved.
 - `POST /admin/invitations`
 - `PUT /admin/users/{id}/roles`
 
-**SI (session-based, no device registry)**
+**SI (v1: browser-relayed, no device registry)**
 - `GET /catalog?category=&search=&isv=&geo=`
 - `GET /catalog/apps/{id}`
 - `POST /install {app_version_id, system_profile}` → returns signed manifest
-  (or streams it to the Device Agent directly)
-- `POST /install/{manifest_id}/status` → progress/result callback
+  synchronously in the response (browser relays it to the local Device Agent)
+- `POST /install/{manifest_id}/telemetry` → optional aggregate success/failure
+  ping (no device identity retained)
 
-**Device Agent ↔ Catalog Service** (session-scoped, not a persistent roster)
-- `POST /agent/system-profile-challenge/respond` (answers a catalog "challenge")
-- `GET /agent/manifest/{manifest_id}` (fetch signed manifest, verify signature locally)
-- `POST /agent/manifest/{manifest_id}/status` (install/upgrade/uninstall result)
-
-**Storefront/CLI ↔ Device Agent** (local loopback, HTTPS + cert)
+**Storefront/CLI ↔ Device Agent** (local loopback only, HTTPS + cert — the only
+device-facing channel needed in v1)
 - `GET /local/system-profile`
-- `POST /local/install {manifest}` (trigger local install of a fetched manifest)
+- `POST /local/install {manifest}` (verify signature/compatibility, install via OEP Installer)
+- `POST /local/upgrade {manifest}` / `POST /local/uninstall {app_version_id}`
 - `GET /local/installed-apps` (local status/health, for "view installed apps")
 
 ## 8. Cross-Cutting Concerns
@@ -289,7 +420,7 @@ installable until the new one is approved.
 | Concern | AWS Service | Notes |
 |---|---|---|
 | SSO / Login | **Amazon Cognito** federated with Intel IdP via SAML/OIDC | Invite-only user pools match allowlist requirement |
-| API layer | **API Gateway** + **ECS Fargate** (or Lambda for lighter endpoints) | Include a WebSocket API or long-poll endpoint for the Device Agent's manifest fetch, since there is no persistent device connection to manage |
+| API layer | **API Gateway** + **ECS Fargate** (or Lambda for lighter endpoints) | v1: plain request/response only — `POST /install` returns the signed manifest synchronously to the browser; no WebSocket/long-poll needed since there's no direct cloud→device leg |
 | App/version/user metadata | **Amazon RDS (Postgres)** | Relational integrity for lifecycle states |
 | Search/browse index | **OpenSearch Service** (optional) or Postgres full-text | Start with Postgres |
 | Compose/baremetal files, config/data files, evidence, icons | **Amazon S3** (private, per-org prefix) | Access via short-lived pre-signed URLs only |
@@ -384,11 +515,10 @@ duplication-of-install-logic problem at the Tier-3 boundary — worth flagging t
 the OEP Installer owner as this design solidifies.
 
 ### 11.3 Open questions
-1. Does the Device Agent poll Catalog Service for its manifest, or does Catalog
-   Service push directly (needs inbound reachability) — or is it always relayed
-   via the Storefront/CLI's loopback connection? Diagrams suggest a direct
-   cloud→agent leg exists; needs a concrete transport decision (WebSocket vs.
-   long-poll vs. browser-relay-only).
+1. ~~Device Agent transport~~ — **resolved for v1**: browser-relay-only (§3.1,
+   §4.5); no direct cloud→agent leg or persistent connection needed since the
+   user browses the catalog from the device they're installing onto. Revisit
+   only if a future phase needs remote/fleet-initiated installs.
 2. Does "Send back" preserve the same `app_version` row or create a revision history?
 3. Multi-version support: can an SI stay on an older Listed version after a new one is approved?
 4. Geography filter — self-declared by ISV, or derived from org profile?
@@ -400,3 +530,11 @@ the OEP Installer owner as this design solidifies.
 8. Edge Pack signing/security model, and whether Device Agent + OEP Installer as
    hard Edge Pack dependencies is the right long-term distribution mechanism
    (both flagged as open issues in the source architecture deck).
+9. **Loopback cert provisioning strategy (new)**: wildcard-DNS-to-loopback with
+   a real public CA cert (Plex-style) vs. a pre-installed private root CA
+   (Docker Desktop-style)? This decision must be made before Device Agent
+   implementation starts, and needs sign-off from Intel's PKI/security team
+   given it involves either public DNS delegation or installing a trusted root
+   CA on customer devices. Also needs confirmation that Chrome/Edge's Private
+   Network Access preflight behavior (§3.1.1c) works as expected across the
+   versions Intel intends to support.
