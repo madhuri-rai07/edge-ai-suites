@@ -21,6 +21,31 @@ def looks_like_secret(env_key: str) -> bool:
     return any(hint in upper for hint in SECRET_KEY_HINTS)
 
 
+def _split_volume_source(vol: str) -> str | None:
+    """
+    Returns the source (host-side) part of a `src:dst[:mode]` compose
+    volume string, splitting on the first ":" that is NOT inside a
+    `${VAR:-default}` interpolation block.
+
+    Naive `str.split(":", 1)` breaks on real-world compose files that use
+    shell-style defaults like `${APP_DIR:-..}/src/config:/app/config:ro`
+    — it would split inside `${APP_DIR:-..}` (at the colon before `-..}`)
+    instead of at the real path separator, silently losing every such
+    volume. Discovered while onboarding a real app
+    (smart-traffic-intersection-agent) through this reference
+    implementation.
+    """
+    depth = 0
+    for i, ch in enumerate(vol):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(0, depth - 1)
+        elif ch == ":" and depth == 0:
+            return vol[:i]
+    return None
+
+
 def parse_compose(compose_bytes: bytes) -> dict:
     """
     Returns {"images": [{service_name, image_ref}], "settings": [env_key],
@@ -57,9 +82,11 @@ def parse_compose(compose_bytes: bytes) -> dict:
 
         for vol in service.get("volumes", []) or []:
             if isinstance(vol, str) and ":" in vol:
-                src = vol.split(":", 1)[0]
-                if src.startswith("./") or src.startswith("../") or (
-                    not src.startswith("/") and "/" in src
+                src = _split_volume_source(vol)
+                if src and (
+                    src.startswith("./")
+                    or src.startswith("../")
+                    or (not src.startswith("/") and "/" in src)
                 ):
                     referenced_files.append(src)
 
