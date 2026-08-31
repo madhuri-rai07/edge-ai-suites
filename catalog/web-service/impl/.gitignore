@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+.venv/
+__pycache__/
+*.pyc
+catalog.db
+catalog-service/_storage/
+device-agent/pki/
+device-agent/_installs/

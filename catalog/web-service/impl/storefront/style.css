@@ -1,0 +1,22 @@
+/* SPDX-FileCopyrightText: (C) 2026 Intel Corporation */
+/* SPDX-License-Identifier: Apache-2.0 */
+body { font-family: sans-serif; margin: 0; background: #f7f7f9; color: #222; }
+header { background: #0b3d91; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+header h1 { margin: 0; font-size: 1.3rem; }
+.badge { font-size: 0.65rem; background: #ffb100; color: #222; padding: 2px 8px; border-radius: 10px; vertical-align: middle; }
+nav { display: flex; background: #142c57; }
+nav button { flex: none; background: none; border: none; color: #cfd8ef; padding: 0.8rem 1.4rem; cursor: pointer; }
+nav button.active { color: white; background: #0b3d91; font-weight: bold; }
+main { padding: 1.5rem 2rem; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+.status-box { padding: 0.5rem 1rem; border-radius: 6px; background: #eee; margin-bottom: 1rem; font-size: 0.9rem; }
+.status-box.ok { background: #d7f5da; }
+.status-box.bad { background: #fbdada; }
+.app-card { background: white; border-radius: 8px; padding: 1rem; margin-bottom: 0.8rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+.app-card h3 { margin: 0 0 0.3rem 0; }
+.app-card button { margin-top: 0.5rem; }
+form, #screen2 { display: flex; flex-direction: column; gap: 0.6rem; max-width: 480px; }
+pre#onboarding-log, #install-log { background: #10131a; color: #b6ffb0; padding: 1rem; border-radius: 6px; white-space: pre-wrap; max-height: 300px; overflow: auto; margin-top: 1rem; font-size: 0.8rem; }
+.setting-row, .image-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.3rem; }
+button { cursor: pointer; }

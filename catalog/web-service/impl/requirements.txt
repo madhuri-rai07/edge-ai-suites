@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pyyaml
+python-multipart
+httpx
+pytest
+cryptography
+email-validator
+requests

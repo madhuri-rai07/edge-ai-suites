@@ -1,0 +1,77 @@
+<!-- SPDX-FileCopyrightText: (C) 2026 Intel Corporation -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Edge AI Catalog — Storefront (local reference implementation)</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Edge AI Catalog <span class="badge">local reference implementation</span></h1>
+    <div id="role-switcher">
+      <label>Acting as:
+        <select id="user-select"></select>
+      </label>
+      <button id="seed-btn">Seed demo data</button>
+    </div>
+  </header>
+
+  <nav>
+    <button class="tab-btn active" data-tab="catalog">Catalog (D1/D2)</button>
+    <button class="tab-btn" data-tab="onboarding">ISV Onboarding (B1)</button>
+    <button class="tab-btn" data-tab="admin">Admin Review (C1)</button>
+  </nav>
+
+  <main>
+    <section id="tab-catalog" class="tab-panel active">
+      <h2>Browse listed apps</h2>
+      <div id="device-agent-status" class="status-box">Device Agent: checking...</div>
+      <div id="catalog-list"></div>
+      <div id="install-log"></div>
+    </section>
+
+    <section id="tab-onboarding" class="tab-panel">
+      <h2>Screen 1 — New App</h2>
+      <form id="screen1-form">
+        <input name="name" placeholder="App name" required />
+        <select name="category">
+          <option>Retail</option>
+          <option>Industrial</option>
+          <option>Robotics</option>
+          <option>Cities & Infrastructure</option>
+          <option>Education</option>
+          <option>Other</option>
+        </select>
+        <textarea name="description" placeholder="Description"></textarea>
+        <input name="license_title" placeholder="License title (e.g. Standard EULA)" required />
+        <input name="license_url" placeholder="License text URL" required />
+        <label>Compose file: <input type="file" name="compose_file" required /></label>
+        <button type="submit">Continue to Screen 2</button>
+      </form>
+
+      <div id="screen2" style="display:none">
+        <h2>Screen 2 — Finish details (pre-filled, edit exceptions)</h2>
+        <div id="images-editor"></div>
+        <div id="settings-editor"></div>
+        <label>Hardware requirements (JSON): <input id="hw-reqs" value='{"cpu":"x86_64","memory_gb":16}' /></label>
+        <label>Test evidence URL: <input id="evidence-url" value="https://example.com/evidence.pdf" /></label>
+        <button id="submit-btn">Submit for review</button>
+      </div>
+      <pre id="onboarding-log"></pre>
+    </section>
+
+    <section id="tab-admin" class="tab-panel">
+      <h2>Pending review</h2>
+      <div id="admin-list"></div>
+    </section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+  <script src="catalog.js"></script>
+  <script src="onboarding.js"></script>
+  <script src="admin.js"></script>
+</body>
+</html>
