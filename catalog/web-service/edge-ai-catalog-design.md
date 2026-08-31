@@ -329,6 +329,23 @@ PKI/signing needed) — see §3.1 for the full sequence:
 - **CLI (`eaictl`) note**: the CLI plays the same relay role as the browser
   when used instead of/alongside the Storefront — it also runs on the device
   and talks to the local Device Agent over loopback.
+- **Considered alternative — cloud-relay WebSocket** *(new — [CONFIRMED])*:
+  raised by a reviewer as the fix for two loopback shortfalls: (a) local TLS
+  cert-trust friction (a browser served over HTTPS refuses an untrusted local
+  endpoint — mixed content), and (b) no remote install (the browser/SI must
+  be physically at the device). Cloud-relay (agent opens a persistent
+  outbound WebSocket to the cloud at bootstrap; cloud pushes install
+  commands down it) is the standard fix for remote/fleet management and
+  avoids per-device loopback TLS entirely. **Decision: out of scope for v1.**
+  v1 explicitly assumes the SI is physically at the device at install time,
+  so (b) doesn't apply, and (a) is treated as a UX problem (pre-installing
+  the loopback CA via OEP Installer) rather than an architecture one. Note
+  for future revisit: adopting cloud-relay is not a small transport swap —
+  it requires a real device registry, a device bootstrap/enrollment step
+  (a persistent per-device identity/credential is still needed, just moved
+  from a TLS cert to an app-layer token), and a stateful cloud-side
+  connection-manager service — i.e., it reopens the "no persistent device
+  registry / no fleet management" decision above, not just the transport.
 
 ### 4.6 Notification Service
 - Email/webhook on: submission received, sent-back, approved, rejected,
