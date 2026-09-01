@@ -97,6 +97,11 @@ def main():
                 [
                     x509.DNSName("localhost"),
                     x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                    # TEST-ONLY: adds the host's LAN IP to the cert SAN so a
+                    # remote browser (e.g. a laptop) can reach this agent
+                    # over the network. Production Device Agents must stay
+                    # loopback-only (127.0.0.1) — see HOST in device_agent.py.
+                    x509.IPAddress(ipaddress.ip_address(os.environ.get("AGENT_EXTRA_IP", "127.0.0.1"))),
                 ]
             ),
             critical=False,

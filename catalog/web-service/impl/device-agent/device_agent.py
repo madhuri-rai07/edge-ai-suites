@@ -33,7 +33,11 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-HOST = "127.0.0.1"  # loopback ONLY
+# TEST-ONLY override: set AGENT_HOST=0.0.0.0 (or a LAN IP) to let a remote
+# browser (e.g. a Windows laptop) reach this agent for local testing.
+# Production Device Agents MUST stay loopback-only ("127.0.0.1") — binding
+# to a network interface exposes the install-redeem API to the LAN.
+HOST = os.environ.get("AGENT_HOST", "127.0.0.1")
 PORT = 47100
 PKI_DIR = os.path.join(os.path.dirname(__file__), "pki")
 ALLOWED_ORIGIN = os.environ.get("STOREFRONT_ORIGIN", "http://127.0.0.1:5500")
